@@ -6,18 +6,11 @@ import requests
 from pathlib import Path
 
 def get_google_drive_download_url(url):
-    """
-    Convert a Google Drive view link to a direct download link.
-    Works for /file/d/ID/view and docs.google.com/document/d/ID/edit
-    """
-    # Pattern for drive.google.com/file/d/ID/...
     file_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
     if file_match:
         file_id = file_match.group(1)
         return f'https://drive.google.com/uc?export=download&id={file_id}'
     
-    # Pattern for docs.google.com/document/d/ID/...
-    # Note: These are usually Google Docs, but sometimes they can be exported as PDF
     doc_match = re.search(r'docs\.google\.com/document/d/([a-zA-Z0-9_-]+)', url)
     if doc_match:
         doc_id = doc_match.group(1)
@@ -26,17 +19,9 @@ def get_google_drive_download_url(url):
     return None
 
 def download_file(url, output_path):
-    """Download a file from a URL."""
     try:
         response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        # Check if it's an actual file or a Google login page (unauthorized)
-        if 'html' in response.headers.get('Content-Type', '').lower():
-            if 'google' in url and ('login' in response.text.lower() or 'consent' in response.text.lower()):
-                print(f"  ❌ Permission denied or auth required for {url}")
-                return False
-        
+        response.raise_for_status()    
         with open(output_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -46,7 +31,6 @@ def download_file(url, output_path):
         return False
 
 def process_board_links(txt_path, output_dir):
-    """Download PDFs from links in a text file."""
     print(f"\nProcessing board links from {txt_path}...")
     if not txt_path.exists():
         print(f"Warning: {txt_path} not found.")
@@ -63,7 +47,6 @@ def process_board_links(txt_path, output_dir):
             if download_url:
                 filename = f"board_resume_{i+1}.pdf"
                 dest = output_dir / filename
-                print(f"  Downloading {filename}...")
                 if download_file(download_url, dest):
                     print(f"  ✅ Saved to {dest}")
                 else:
@@ -72,7 +55,6 @@ def process_board_links(txt_path, output_dir):
             print(f"  ⚠️ Skipping non-Google link: {link}")
 
 def process_member_json(json_path, output_dir):
-    """Download PDFs from links in a JSON file."""
     print(f"\nProcessing member links from {json_path}...")
     if not json_path.exists():
         print(f"Warning: {json_path} not found.")
