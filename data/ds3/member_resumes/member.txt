@@ -3,7 +3,7 @@
     "full_name": "Alan Adams",
     "email": "ala036@ucsd.edu",
     "graduation_year": "2029",
-    "major": "Data Science (B.S.)",
+    "major": "Data Sciencs (B.S.)",
     "resume_link": "https://drive.google.com/file/d/1asblRKqxkT-bcd_6_3Xm0mEQrv8_R37s/view?usp=sharing",
     "linkedin_link": "https://www.linkedin.com/in/alanb-adams/",
     "github_link": null,

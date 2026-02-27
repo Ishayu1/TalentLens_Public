@@ -1,0 +1,6 @@
+# Downloaded files (stored on Dropbox, not in git)
+images/
+pdfs/
+
+# Environment variables
+.env

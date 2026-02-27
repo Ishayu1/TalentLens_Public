@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Script to download files (images and PDFs) from .webloc files in data/discord/links/
+Script to download files (images and PDFs) from .webloc and .url files in data/discord/links/
 """
 
+import configparser
 import hashlib
 import os
 import plistlib
@@ -22,12 +23,33 @@ def extract_url_from_webloc(webloc_path):
         return None
 
 
+def extract_url_from_url_file(url_path):
+    """Extract URL from a Windows .url file (INI format)"""
+    try:
+        config = configparser.ConfigParser()
+        config.read(url_path, encoding='utf-8')
+        return config.get('InternetShortcut', 'URL', fallback=None)
+    except Exception as e:
+        print(f"✗ Error reading {url_path.name}: {e}")
+        return None
+
+
+def extract_url(link_path):
+    """Extract URL from either a .webloc or .url file"""
+    if link_path.suffix.lower() == '.webloc':
+        return extract_url_from_webloc(link_path)
+    elif link_path.suffix.lower() == '.url':
+        return extract_url_from_url_file(link_path)
+    return None
+
+
 KNOWN_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff'}
 
 
-def get_filename_from_webloc(webloc_path, url):
-    """Get a clean filename from the .webloc filename or URL"""
-    webloc_name = webloc_path.stem  # Remove .webloc extension
+def get_filename_from_link(link_path, url):
+    """Get a clean filename from the .webloc/.url filename or URL"""
+    # Remove the link extension (.webloc or .url)
+    webloc_name = link_path.stem
 
     # Check if the webloc filename has a known file extension (like .pdf or .png)
     ext = os.path.splitext(webloc_name)[1].lower()
@@ -91,8 +113,8 @@ def download_file(url, output_path):
 def main():
     # Define paths
     base_dir = Path(__file__).parent
-    links_dir = base_dir / "data" / "discord" / "links"
-    base_output_dir = base_dir / "data" / "discord"
+    links_dir = base_dir / "links"
+    base_output_dir = base_dir
 
     # Create subdirectories for organization
     images_dir = base_output_dir / "images"
@@ -100,14 +122,16 @@ def main():
     images_dir.mkdir(parents=True, exist_ok=True)
     pdfs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all .webloc files
-    webloc_files = sorted(list(links_dir.glob("*.webloc")))
+    # Find all .webloc and .url files
+    link_files = sorted(
+        list(links_dir.glob("*.webloc")) + list(links_dir.glob("*.url"))
+    )
 
-    if not webloc_files:
-        print("No .webloc files found in data/discord/links/")
+    if not link_files:
+        print("No .webloc or .url files found in data/discord/links/")
         return
 
-    print(f"Found {len(webloc_files)} .webloc file(s)\n")
+    print(f"Found {len(link_files)} link file(s)\n")
 
     # Build hash index of already-downloaded files for content dedup
     seen_hashes = {}  # hash -> filename
@@ -121,7 +145,7 @@ def main():
 
     # Track statistics
     stats = {
-        'total': len(webloc_files),
+        'total': len(link_files),
         'downloaded': 0,
         'skipped_filename': 0,
         'skipped_duplicate': 0,
@@ -129,13 +153,13 @@ def main():
     }
     duplicates = []  # list of (new_filename, existing_filename)
 
-    # Process each .webloc file
-    for idx, webloc_path in enumerate(webloc_files, 1):
-        print(f"[{idx}/{stats['total']}] Processing: {webloc_path.name}")
+    # Process each link file
+    for idx, link_path in enumerate(link_files, 1):
+        print(f"[{idx}/{stats['total']}] Processing: {link_path.name}")
 
         try:
-            # Extract URL from .webloc file
-            url = extract_url_from_webloc(webloc_path)
+            # Extract URL from .webloc or .url file
+            url = extract_url(link_path)
 
             if not url:
                 print(f"✗ Could not extract URL")
@@ -144,7 +168,7 @@ def main():
                 continue
 
             # Get filename and determine file type
-            filename = get_filename_from_webloc(webloc_path, url)
+            filename = get_filename_from_link(link_path, url)
             file_type = get_file_type(filename)
 
             # Determine output directory based on file type

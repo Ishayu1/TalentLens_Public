@@ -1,3 +1,29 @@
+# Resume parsing & data
 pdfplumber
 pandas
 tqdm
+numpy
+
+# Document & image processing
+Pillow
+pytesseract
+python-docx
+
+# Embeddings & similarity (resume_matching_pipeline)
+sentence-transformers
+torch
+faiss-cpu
+
+# API (resume_matching_pipeline)
+fastapi
+pydantic
+
+# Streamlit UI (streamlit/)
+streamlit
+
+# Reddit scraping (data/reddit/data.ipynb)
+requests
+
+# Dropbox upload (data/discord/upload_to_dropbox.py)
+dropbox
+python-dotenv
