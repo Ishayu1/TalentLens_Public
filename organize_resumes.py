@@ -36,7 +36,7 @@ def find_all_resumes(data_dir):
         'resume-dataset/data',
         'Resumes PDF'
     ]
-    valid_extensions = {'.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx', '.txt'}
+    valid_extensions = {'.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx'}
     
     for folder in source_folders:
         folder_path = Path(data_dir) / folder
@@ -166,15 +166,24 @@ def organize_resumes(data_dir, train_ratio=0.8):
     output_dir = Path(data_dir).parent
     train_dir = output_dir / 'train'
     test_dir = output_dir / 'test'
-    val_dir = output_dir / 'val'
+    test_board_dir = test_dir / 'board'
+    test_members_dir = test_dir / 'members'
     duplicates_dir = output_dir / 'duplicates'
     
     # Remove old folders if they exist
-    for dir_path in [train_dir, test_dir, val_dir, duplicates_dir]:
+    for dir_path in [train_dir, test_dir, duplicates_dir]:
         if dir_path.exists():
             shutil.rmtree(dir_path)
         dir_path.mkdir(exist_ok=True)
         print(f"Created directory: {dir_path}")
+    
+    test_board_dir.mkdir(exist_ok=True)
+    test_members_dir.mkdir(exist_ok=True)
+    
+    # Ensure val directory is cleaned up if it exists from previous runs
+    val_dir = output_dir / 'val'
+    if val_dir.exists():
+        shutil.rmtree(val_dir)
     
     # Find all resumes
     print("\nScanning for resumes...")
@@ -192,8 +201,8 @@ def organize_resumes(data_dir, train_ratio=0.8):
     # Statistics
     stats = {
         'train': 0,
-        'test': 0,
-        'val': 0,
+        'test_board': 0,
+        'test_members': 0,
         'duplicates': 0,
         'total': len(all_resumes)
     }
@@ -206,10 +215,15 @@ def organize_resumes(data_dir, train_ratio=0.8):
     non_ds3_hash_groups = {}
     
     for hash_val, files in hash_to_files.items():
-        # Sort files by mtime (latest first)
-        files.sort(key=lambda x: x['mtime'], reverse=True)
+        # Sort files: board first, then member, then by mtime
+        def sort_priority(x):
+            if x['source'] == 'ds3_board': return 0
+            if x['source'] == 'ds3_member': return 1
+            return 2
+            
+        files.sort(key=lambda x: (sort_priority(x), x['mtime']), reverse=False)
         
-        # Latest one is the "active" file
+        # Latest one (with priority) is the "active" file
         active_file = files[0]
         duplicates = files[1:]
         
@@ -222,16 +236,25 @@ def organize_resumes(data_dir, train_ratio=0.8):
     print(f"\nProcessing {len(ds3_hash_groups)} ds3 hash groups -> test/")
     for hash_val, group in ds3_hash_groups.items():
         active = group['active']
-        dest_path = get_unique_path(test_dir, active['filename'])
+        
+        if active['source'] == 'ds3_board':
+            dest_dir = test_board_dir
+            location = 'test/board'
+            stats['test_board'] += 1
+        else:
+            dest_dir = test_members_dir
+            location = 'test/members'
+            stats['test_members'] += 1
+            
+        dest_path = get_unique_path(dest_dir, active['filename'])
         shutil.copy2(active['path'], dest_path)
-        stats['test'] += 1
         
         # Manifest entry for active
         hash_manifest[hash_val] = {
             'filename': dest_path.name,
             'original_path': active['path'],
             'source': active['source'],
-            'location': 'test',
+            'location': location,
             'duplicates': []
         }
         
@@ -244,33 +267,17 @@ def organize_resumes(data_dir, train_ratio=0.8):
                 'filename': dup_dest.name,
                 'original_path': dup['path'],
                 'source': dup['source'],
-                'duplicate_of': f"test/{dest_path.name}"
+                'duplicate_of': f"{location}/{dest_path.name}"
             })
     
-    # Split non-ds3 between train and val
-    import random
-    random.seed(42)
-    hash_list = list(non_ds3_hash_groups.keys())
-    random.shuffle(hash_list)
+    # Put all non-ds3 into train
+    print(f"\nProcessing {len(non_ds3_hash_groups)} non-ds3 hash groups -> train/")
     
-    train_split_index = int(len(hash_list) * train_ratio)
-    
-    print(f"\nProcessing {len(hash_list)} non-ds3 hash groups:")
-    print(f"  - {train_split_index} -> train/")
-    print(f"  - {len(hash_list) - train_split_index} -> val/")
-    
-    for i, hash_val in enumerate(hash_list):
-        group = non_ds3_hash_groups[hash_val]
+    for hash_val, group in non_ds3_hash_groups.items():
         active = group['active']
-        
-        if i < train_split_index:
-            dest_dir = train_dir
-            location = 'train'
-            stats['train'] += 1
-        else:
-            dest_dir = val_dir
-            location = 'val'
-            stats['val'] += 1
+        dest_dir = train_dir
+        location = 'train'
+        stats['train'] += 1
             
         dest_path = get_unique_path(dest_dir, active['filename'])
         shutil.copy2(active['path'], dest_path)
@@ -306,8 +313,8 @@ def organize_resumes(data_dir, train_ratio=0.8):
     print("="*60)
     print(f"Total files found: {stats['total']}")
     print(f"  - Train: {stats['train']}")
-    print(f"  - Val: {stats['val']}")
-    print(f"  - Test: {stats['test']} (all ds3 files)")
+    print(f"  - Test (Board): {stats['test_board']}")
+    print(f"  - Test (Members): {stats['test_members']}")
     print(f"  - Duplicates: {stats['duplicates']}")
     print(f"\nHash manifest saved to: {manifest_path}")
     print(f"Total unique resumes: {len(hash_manifest)}")
@@ -321,9 +328,9 @@ if __name__ == "__main__":
     print(f"Data directory: {data_dir}")
     print("\nRules:")
     print("  - test: ALL ds3 files")
-    print("  - train/val: Everything else (80/20 split)")
+    print("  - train: Everything else (reddit, discord, resume dataset, resumes PDF)")
     print("  - Duplicates: Move older versions to duplicates/ folder\n")
     
-    organize_resumes(str(data_dir), train_ratio=0.8)
+    organize_resumes(str(data_dir))
     
     print("\n✓ Done! You can now use check_duplicate() function to verify new uploads.")

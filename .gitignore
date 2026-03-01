@@ -9,6 +9,7 @@ viva/
 venv/
 env/
 ml/
+
 .env
 __pycache__/
 *.py[cod]

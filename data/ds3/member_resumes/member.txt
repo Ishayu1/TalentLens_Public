@@ -124,7 +124,7 @@
     "email": "cisicat@ucsd.edu",
     "graduation_year": "2026",
     "major": "Data Science (B.S.)",
-    "resume_link": "https://docs.google.com/document/d/1LGcSgXJ9vzXLBio_4G5_c6AjLBx32SjOOUtJPA3-9r4/edit?usp=drivesdk",
+    "resume_link": "https://docs.google.com/document/d/1LGcSgXJ9vzXLBio_4G5_c6AjLBx32SjOOUtJPA3-9r4/edit?tab=t.l6yjdwqyotkg",
     "linkedin_link": "https://www.linkedin.com/in/camille-sicat-8b3267256/",
     "github_link": "https://github.com/couchsnail",
     "other_link": ""

@@ -1,37 +1,45 @@
 import os
 import img2pdf
 from pathlib import Path
+from PIL import Image
 
-def convert_png_to_pdf(data_dir):
-    print(f"Scanning {data_dir} for .png files...")
+def convert_images_to_pdf(data_dir):
+    print(f"Scanning {data_dir} for images to convert to PDF...")
     
-    png_files = []
+    image_extensions = {'.png', '.jpg', '.jpeg'}
+    image_files = []
     for root, dirs, files in os.walk(data_dir):
+        # Skip directories already processed or output directories
+        if any(x in root for x in ['train', 'test', 'duplicates']):
+            continue
+            
         for file in files:
-            if file.lower().endswith('.png'):
-                png_files.append(Path(root) / file)
+            ext = Path(file).suffix.lower()
+            if ext in image_extensions:
+                image_files.append(Path(root) / file)
     
-    total = len(png_files)
-    print(f"Found {total} .png files to convert.")
+    total = len(image_files)
+    print(f"Found {total} image files to convert.")
     
     converted_count = 0
     error_count = 0
     
-    for i, png_path in enumerate(png_files, 1):
-        pdf_path = png_path.with_suffix('.pdf')
-        print(f"[{i}/{total}] Converting {png_path.name}...")
+    for i, img_path in enumerate(image_files, 1):
+        pdf_path = img_path.with_suffix('.pdf')
+        print(f"[{i}/{total}] Converting {img_path.name} to {pdf_path.name}...")
         
         try:
-            # Convert PNG to PDF bytes
+            # Open image to verify/auto-rotate if needed (though img2pdf handles most)
+            # and write to PDF
             with open(pdf_path, "wb") as f:
-                f.write(img2pdf.convert(str(png_path)))
+                f.write(img2pdf.convert(str(img_path)))
             
-            # If successful, remove the original PNG
-            os.remove(png_path)
+            # Remove original image
+            os.remove(img_path)
             converted_count += 1
-            print(f"  ✅ Converted and removed original.")
+            print(f"  ✅ Success.")
         except Exception as e:
-            print(f"  ❌ Error converting {png_path.name}: {e}")
+            print(f"  ❌ Error: {e}")
             error_count += 1
             
     print("\n" + "="*60)
@@ -42,6 +50,6 @@ def convert_png_to_pdf(data_dir):
     print("="*60)
 
 if __name__ == "__main__":
-    project_root = Path(__file__).parent
-    data_dir = project_root / "data"
-    convert_png_to_pdf(data_dir)
+    script_dir = Path(__file__).parent
+    data_dir = script_dir / "data"
+    convert_images_to_pdf(data_dir)
