@@ -1,64 +1,70 @@
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-import faiss
-import json
-import numpy as np
-import os
-from streamlit.grok_utils import extract_skills_with_grok
-# Note: we assume streamlit is in the same directory or grok_utils is accessible.
-# Since grok_utils is currently in streamlit/, we might need to adjust or move it.
+from pathlib import Path
+import sys
+
+STREAMLIT_DIR = Path(__file__).resolve().parent / "streamlit"
+if str(STREAMLIT_DIR) not in sys.path:
+    sys.path.insert(0, str(STREAMLIT_DIR))
+
+from search import SearchEngine
 
 app = FastAPI()
 
-# Load model and index on startup
-model = SentenceTransformer('all-MiniLM-L6-v2')
-index = faiss.read_index('resume_index.faiss')
-with open('member_resumes_metadata.json', 'r') as f:
-    resumes_metadata = json.load(f)
+# Load shared search engine on startup so API and Streamlit rank identically.
+engine = SearchEngine()
 
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 10
     min_score: float = 0.0
-    input_mode: str = "Skills" # Added input_mode
-    api_key: str | None = None # Added api_key
+    input_mode: str = "Skills"
+    api_key: str | None = None
 
 @app.post("/search")
 async def search_resumes(request: SearchRequest):
-    query = request.query
-    skill_filters = []
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query must not be empty.")
 
-    # --- Backend Grok Skill Extraction ---
-    if request.input_mode == "Job Description":
-        extracted_skills = extract_skills_with_grok(query, api_key=request.api_key)
-        if extracted_skills:
-            skill_filters = extracted_skills
+    results = engine.search(
+        query=request.query,
+        top_k=request.top_k,
+        min_score=request.min_score,
+        input_mode=request.input_mode,
+        api_key=request.api_key,
+    )
 
-    # Create query embedding
-    query_embedding = model.encode([query])
-    query_embedding = query_embedding.astype('float32')
-    faiss.normalize_L2(query_embedding)
-
-    # Search
-    scores, indices = index.search(query_embedding, request.top_k)
-
-    # Format results
-    results = []
-    for idx, score in zip(indices[0], scores[0]):
-        if score >= request.min_score:
-            resume = resumes_metadata[idx]
-            results.append({
-                'filename': resume['filename'],
-                'score': float(score),
-                'file_path': resume['file_path']
-            })
-
-    return {'results': results}
+    return {
+        "results": [
+            {
+                "rank": result.rank,
+                "filename": result.filename,
+                "score": float(result.score),
+                "semantic_score": float(result.semantic_score),
+                "recruiter_score": float(result.recruiter_score),
+                "resume_quality_score": float(result.resume_quality_score),
+                "file_path": result.file_path,
+                "full_name": result.full_name,
+                "major": result.major,
+                "graduation_year": result.graduation_year,
+                "matched_skills": result.matched_skills,
+                "explanation": result.explanation,
+                "recruiter_breakdown": result.recruiter_breakdown,
+                "resume_quality_breakdown": result.resume_quality_breakdown,
+                "resume_flags": result.resume_flags,
+                "hard_fail_flags": result.hard_fail_flags,
+            }
+            for result in results
+        ]
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "num_resumes": len(resumes_metadata)}
+    return {
+        "status": "healthy",
+        "num_resumes": engine.resume_count,
+        "demo_mode": engine.demo_mode,
+        "mode_label": engine.mode_label,
+    }
 
 # Run with: uvicorn api:app --reload

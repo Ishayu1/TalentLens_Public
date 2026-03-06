@@ -50,15 +50,13 @@ def render_header():
 
 
 # ---------------------------------------------------------------------------
-# Demo-mode banner
+# Engine-mode banner
 # ---------------------------------------------------------------------------
-def render_demo_banner():
+def render_demo_banner(message: str):
     st.markdown(
-        """
+        f"""
         <div class="demo-banner">
-            <strong>Demo Mode</strong> &mdash; Pipeline artifacts not found.
-            Showing synthetic results. Run <code>resume_matching_pipeline.ipynb</code>
-            to generate the FAISS index and metadata for real search.
+            <strong>Search Mode Notice</strong> &mdash; {message}
         </div>
         """,
         unsafe_allow_html=True,
@@ -162,9 +160,8 @@ def render_sidebar_filters(grad_years: list[str], majors: list[str]):
 # ---------------------------------------------------------------------------
 # Sidebar — stats
 # ---------------------------------------------------------------------------
-def render_sidebar_stats(resume_count: int, demo: bool):
+def render_sidebar_stats(resume_count: int, mode_text: str):
     st.sidebar.markdown("---")
-    mode_text = "Demo" if demo else "Live"
     st.sidebar.markdown(
         f"""
         <div class="stat-card">
@@ -327,6 +324,11 @@ def _render_detail_panel(r: ResumeResult):
             st.markdown(f'<span class="detail-label">Graduation:</span> <span class="detail-value">{r.graduation_year}</span>', unsafe_allow_html=True)
 
     with col2:
+        if r.local_resume_path:
+            st.markdown(
+                f'<span class="detail-label">Local Resume:</span> <span class="detail-value">{Path(r.local_resume_path).name}</span>',
+                unsafe_allow_html=True,
+            )
         if r.resume_link:
             st.markdown(f'<span class="detail-label">Resume:</span> <a href="{r.resume_link}" target="_blank" class="open-link">Open PDF &rarr;</a>', unsafe_allow_html=True)
         if r.linkedin:
@@ -334,12 +336,60 @@ def _render_detail_panel(r: ResumeResult):
         if r.github:
             st.markdown(f'<span class="detail-label">GitHub:</span> <a href="{r.github}" target="_blank" class="open-link">Profile &rarr;</a>', unsafe_allow_html=True)
 
+    if r.local_resume_path:
+        pdf_path = Path(r.local_resume_path)
+        pdf_bytes = pdf_path.read_bytes()
+        pdf_b64 = base64.b64encode(pdf_bytes).decode()
+        st.markdown(
+            f"""
+            <div style="margin-top:0.8rem; margin-bottom:0.5rem; font-size:0.85rem; opacity:0.8;">
+                Resume Preview
+            </div>
+            <iframe
+                src="data:application/pdf;base64,{pdf_b64}"
+                width="100%"
+                height="900"
+                style="border:1px solid rgba(255,255,255,0.1); border-radius:8px; background:white;"
+            ></iframe>
+            """,
+            unsafe_allow_html=True,
+        )
+
     if r.matched_skills:
         skills_html = "".join(f'<span class="matched-skill">{s}</span>' for s in r.matched_skills)
         st.markdown(
             f'<div style="margin-top:0.6rem;"><span class="detail-label">Matched Skills:</span><br/>{skills_html}</div>',
             unsafe_allow_html=True,
         )
+
+    if r.recruiter_score or r.resume_quality_score:
+        st.markdown("### Score Breakdown")
+        score_cols = st.columns(3)
+        score_cols[0].metric("Combined Score", f"{r.score:.3f}")
+        score_cols[1].metric("Job Match", f"{r.recruiter_score:.1f}/10")
+        score_cols[2].metric("Resume Quality", f"{r.resume_quality_score:.1f}/10")
+
+    if r.hard_fail_flags:
+        st.error("Hard-fail risks: " + ", ".join(r.hard_fail_flags))
+
+    if r.resume_flags:
+        st.warning("Revision flags: " + ", ".join(r.resume_flags))
+
+    rubric = getattr(r, "resume_quality_breakdown", {}) or {}
+    if rubric:
+        strengths = rubric.get("strengths", [])
+        risks = rubric.get("risks", [])
+        summary = rubric.get("summary", "")
+        if summary:
+            st.markdown(f"**Resume Summary:** {summary}")
+        if strengths:
+            st.markdown("**Strengths**")
+            for item in strengths:
+                st.markdown(f"- {item}")
+        if risks:
+            st.markdown("**Risks**")
+            for item in risks:
+                st.markdown(f"- {item}")
 
     explanation = getattr(r, "explanation", "")
     if explanation:

@@ -73,8 +73,8 @@ if "last_results" not in st.session_state:
 # ---------------------------------------------------------------------------
 render_header()
 
-if engine.demo_mode:
-    render_demo_banner()
+if engine.mode_banner:
+    render_demo_banner(engine.mode_banner)
 
 # ---------------------------------------------------------------------------
 # Skills panel (collapsible, inline below header)
@@ -88,7 +88,7 @@ grad_years = engine.get_unique_grad_years()
 majors = engine.get_unique_majors()
 grad_year_filter, major_filter, top_k = render_sidebar_filters(grad_years, majors)
 
-render_sidebar_stats(engine.resume_count, engine.demo_mode)
+render_sidebar_stats(engine.resume_count, engine.mode_label)
 
 # ---------------------------------------------------------------------------
 # Search bar
@@ -151,7 +151,7 @@ if search_clicked:
                 for res in results[:3]:
                     res.explanation = get_explanation_with_grok(
                         job_description=query,
-                        candidate_text=res.text_preview,
+                        candidate_text=res.full_text or res.text_preview,
                         candidate_name=res.full_name
                     )
         
