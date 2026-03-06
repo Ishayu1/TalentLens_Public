@@ -10,16 +10,15 @@ if str(STREAMLIT_DIR) not in sys.path:
 from search import SearchEngine
 
 app = FastAPI()
-
-# Load shared search engine on startup so API and Streamlit rank identically.
 engine = SearchEngine()
+
 
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 10
     min_score: float = 0.0
     input_mode: str = "Skills"
-    api_key: str | None = None
+
 
 @app.post("/search")
 async def search_resumes(request: SearchRequest):
@@ -31,32 +30,30 @@ async def search_resumes(request: SearchRequest):
         top_k=request.top_k,
         min_score=request.min_score,
         input_mode=request.input_mode,
-        api_key=request.api_key,
     )
 
     return {
+        "parsed_job_description": engine.last_query_analysis if request.input_mode == "Job Description" else None,
         "results": [
             {
                 "rank": result.rank,
                 "filename": result.filename,
+                "candidate_id": result.candidate_id,
                 "score": float(result.score),
                 "semantic_score": float(result.semantic_score),
-                "recruiter_score": float(result.recruiter_score),
-                "resume_quality_score": float(result.resume_quality_score),
                 "file_path": result.file_path,
                 "full_name": result.full_name,
                 "major": result.major,
                 "graduation_year": result.graduation_year,
                 "matched_skills": result.matched_skills,
-                "explanation": result.explanation,
-                "recruiter_breakdown": result.recruiter_breakdown,
-                "resume_quality_breakdown": result.resume_quality_breakdown,
-                "resume_flags": result.resume_flags,
-                "hard_fail_flags": result.hard_fail_flags,
+                "top_evidence_chunks": result.top_evidence_chunks,
+                "hard_filter_status": result.hard_filter_status,
+                "ranking_details": result.ranking_details,
             }
             for result in results
-        ]
+        ],
     }
+
 
 @app.get("/health")
 async def health():
@@ -65,6 +62,5 @@ async def health():
         "num_resumes": engine.resume_count,
         "demo_mode": engine.demo_mode,
         "mode_label": engine.mode_label,
+        "retrieval_backend": engine.retrieval_backend,
     }
-
-# Run with: uvicorn api:app --reload

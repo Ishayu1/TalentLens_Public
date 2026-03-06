@@ -73,3 +73,17 @@ data/discord/
 ├── upload_to_dropbox.py        # Uploads files to shared Dropbox folder
 └── data.ipynb                  # Data exploration notebook
 ```
+
+---
+
+### Pipeline: OCR for image-based PDFs
+
+The text extraction pipeline (`pipeline/01_text_extraction.ipynb`) can OCR image-only or scanned PDFs using **Tesseract**. If Tesseract is not installed, you'll see a single warning and OCR fallback will be skipped (pdfplumber text extraction still runs).
+
+**Install Tesseract** (required only for OCR fallback):
+
+- **macOS:** `brew install tesseract`
+- **Linux (apt):** `sudo apt install tesseract-ocr`
+- **Windows:** [Tesseract at GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
+
+Ensure `tesseract` is on your PATH so the `pytesseract` Python package can find it.

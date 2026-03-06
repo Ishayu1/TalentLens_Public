@@ -1,41 +1,21 @@
-"""
-Search engine — loads the FAISS index + sentence-transformer model and
-exposes a simple `search()` API consumed by the Streamlit UI.
-
-If the pipeline artifacts (FAISS index, metadata JSON) haven't been generated
-yet, the engine falls back to **demo mode** with synthetic data so the UI can
-still be developed and previewed.
-"""
-
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-import os
-try:
-    from grok_utils import (
-        extract_skills_with_grok,
-        assess_candidate_with_grok,
-        assess_resume_quality_with_grok,
-    )
-except ImportError:
-    from streamlit.grok_utils import (
-        extract_skills_with_grok,
-        assess_candidate_with_grok,
-        assess_resume_quality_with_grok,
-    )
 
 import numpy as np
 import pandas as pd
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 try:
     from config import (
-        CONFIG_JSON_PATH,
         DATA_DIR,
         DEFAULT_TOP_K,
         EMBEDDING_DIM,
@@ -48,9 +28,9 @@ try:
         PROJECT_ROOT,
         SKILL_SUGGESTIONS,
     )
+    from job_description import ParsedJobDescription, parse_job_description
 except ImportError:
     from streamlit.config import (
-        CONFIG_JSON_PATH,
         DATA_DIR,
         DEFAULT_TOP_K,
         EMBEDDING_DIM,
@@ -63,15 +43,13 @@ except ImportError:
         PROJECT_ROOT,
         SKILL_SUGGESTIONS,
     )
+    from streamlit.job_description import ParsedJobDescription, parse_job_description
 
-RECRUITER_RERANK_LIMIT = 8
-RECRUITER_RERANK_BASE_WEIGHT = 0.56
-RECRUITER_RERANK_MATCH_WEIGHT = 0.24
-RECRUITER_RERANK_QUALITY_WEIGHT = 0.20
-RECRUITER_MAX_SCORE = 1.8
-FALLBACK_RESUME_PATH = DATA_DIR / "processed" / "resumes_extracted.json"
-FALLBACK_EMBEDDING_METADATA_PATH = DATA_DIR / "processed" / "resumes_with_embeddings.json"
-FALLBACK_EMBEDDINGS_PATH = DATA_DIR / "processed" / "embeddings.npy"
+
+PROCESSED_DIR = DATA_DIR / "processed"
+PARSED_RESUMES_PATH = PROCESSED_DIR / "resumes_parsed.json"
+RESUME_CHUNKS_PATH = PROCESSED_DIR / "resume_chunks.json"
+CHUNK_METADATA_PATH = PROJECT_ROOT / "member_chunks_metadata.json"
 LOCAL_MEMBER_RESUME_DIRS = [
     MEMBER_RESUMES_DIR,
     PROJECT_ROOT / "test" / "members",
@@ -81,11 +59,17 @@ STOPWORDS = {
     "in", "into", "is", "it", "of", "on", "or", "that", "the", "their", "this",
     "to", "was", "were", "will", "with", "you", "your",
 }
+SECTION_WEIGHTS = {
+    "experience": 1.0,
+    "projects": 0.9,
+    "skills": 0.85,
+    "education": 0.55,
+    "summary": 0.45,
+    "contact": 0.2,
+}
+_SKILL_PATTERNS: dict[str, re.Pattern] = {}
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 @dataclass
 class ResumeResult:
     rank: int
@@ -95,6 +79,7 @@ class ResumeResult:
     file_path: str
     local_resume_path: str
     text_preview: str
+    candidate_id: str = ""
     full_text: str = ""
     source: str = ""
     full_name: str = ""
@@ -103,8 +88,8 @@ class ResumeResult:
     resume_link: str = ""
     linkedin: str = ""
     github: str = ""
-    matched_skills: list = field(default_factory=list)
-    explanation: str = ""  # Grok AI explanation
+    matched_skills: list[str] = field(default_factory=list)
+    explanation: str = ""
     recruiter_score: float = 0.0
     recruiter_breakdown: dict = field(default_factory=dict)
     resume_quality_score: float = 0.0
@@ -112,12 +97,18 @@ class ResumeResult:
     resume_flags: list[str] = field(default_factory=list)
     hard_fail_flags: list[str] = field(default_factory=list)
     ranking_details: dict = field(default_factory=dict)
+    top_evidence_chunks: list[dict] = field(default_factory=list)
+    hard_filter_status: dict = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Keyword skill matcher (supplements semantic search)
-# ---------------------------------------------------------------------------
-_SKILL_PATTERNS: dict[str, re.Pattern] = {}
+@dataclass
+class ChunkHit:
+    candidate_id: str
+    chunk_id: str
+    section_type: str
+    text: str
+    score: float
+    source: str
 
 
 def _build_skill_patterns():
@@ -129,7 +120,6 @@ def _build_skill_patterns():
 
 
 def extract_matched_skills(text: str, query_skills: list[str]) -> list[str]:
-    """Return the subset of *query_skills* that appear in *text*."""
     _build_skill_patterns()
     matched = []
     for skill in query_skills:
@@ -149,228 +139,167 @@ def _tokenize_text(text: str) -> list[str]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Search engine
-# ---------------------------------------------------------------------------
 class SearchEngine:
-    """Wraps FAISS index + sentence-transformers for semantic resume search."""
-
     def __init__(self):
         self.model = None
         self.index = None
-        self.fallback_embeddings: np.ndarray | None = None
-        self.fallback_term_frequencies: list[dict[str, int]] = []
-        self.fallback_doc_lengths: list[int] = []
-        self.fallback_idf: dict[str, float] = {}
-        self.fallback_avg_doc_length: float = 0.0
-        self.metadata: list[dict] = []
+        self.resume_metadata: list[dict] = []
+        self.resume_metadata_by_filename: dict[str, dict] = {}
+        self.chunk_metadata: list[dict] = []
+        self.chunk_candidates: list[dict] = []
+        self.chunk_term_frequencies: list[dict[str, int]] = []
+        self.chunk_doc_lengths: list[int] = []
+        self.chunk_idf: dict[str, float] = {}
+        self.chunk_avg_doc_length: float = 0.0
+        self.parsed_resume_map: dict[str, dict] = {}
+        self.resume_term_frequencies: list[dict[str, int]] = []
+        self.resume_doc_lengths: list[int] = []
+        self.resume_idf: dict[str, float] = {}
+        self.resume_avg_doc_length: float = 0.0
         self.members_df: Optional[pd.DataFrame] = None
-        # Pre-built lookup: lowercased full_name → member meta dict (O(1) lookups)
         self._member_index: dict[str, dict] = {}
+        self.last_query_analysis: dict | None = None
         self.demo_mode = False
         self.mode_label = "Live"
         self.mode_banner = ""
+        self.retrieval_backend = "uninitialized"
         self._load()
 
-    # ----- loading ----------------------------------------------------------
     def _load(self):
-        try:
-            self._load_production()
-        except Exception as exc:
-            print(f"[SearchEngine] Could not load production artifacts: {exc}")
-            try:
-                print("[SearchEngine] Falling back to DS3 resume text search.")
-                self._load_ds3_fallback()
-            except Exception as fallback_exc:
-                print(f"[SearchEngine] Could not load DS3 fallback data: {fallback_exc}")
-                print("[SearchEngine] Falling back to synthetic demo mode.")
-                self._load_demo()
-
-    def _load_production(self):
-        import faiss
-        from sentence_transformers import SentenceTransformer
-
-        if not FAISS_INDEX_PATH.exists():
-            raise FileNotFoundError(f"FAISS index not found at {FAISS_INDEX_PATH}")
-
-        self.model = SentenceTransformer(MODEL_NAME)
-        self.index = faiss.read_index(str(FAISS_INDEX_PATH))
-        self.metadata = self._load_or_build_member_metadata()
-
         if MEMBERS_CSV.exists():
             self.members_df = pd.read_csv(MEMBERS_CSV)
             self._build_member_index()
+
+        self._load_parsed_resumes()
+        self._load_chunk_records()
+        self._load_resume_metadata()
+        self._prepare_resume_text_index()
+        self._load_semantic_backend()
+
+        if self.chunk_metadata:
+            chunk_msg = f"Chunk retrieval ready ({self.retrieval_backend})."
+        elif self.resume_metadata:
+            chunk_msg = "Chunk artifacts unavailable, falling back to resume-level retrieval."
+        else:
+            chunk_msg = "Resume artifacts unavailable, using demo data."
+
+        if not self.chunk_metadata and not self.resume_metadata:
+            self._load_demo()
+            return
 
         self.demo_mode = False
-        self.mode_label = "Live"
-        self.mode_banner = ""
+        self.mode_label = "Live" if self.retrieval_backend.startswith("semantic") else "Fallback"
+        self.mode_banner = chunk_msg
 
-    def _load_or_build_member_metadata(self) -> list[dict]:
-        if METADATA_PATH.exists():
-            with open(METADATA_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+    def _load_parsed_resumes(self):
+        if not PARSED_RESUMES_PATH.exists():
+            return
+        with open(PARSED_RESUMES_PATH, "r", encoding="utf-8") as f:
+            rows = json.load(f)
 
-        if not FALLBACK_RESUME_PATH.exists():
-            raise FileNotFoundError(
-                f"Metadata not found at {METADATA_PATH} and fallback resume data not found at {FALLBACK_RESUME_PATH}"
-            )
-
-        with open(FALLBACK_RESUME_PATH, "r", encoding="utf-8") as f:
-            raw_resumes = json.load(f)
-
-        rebuilt_metadata = []
-        for item in raw_resumes:
-            if item.get("source") != "ds3_members":
+        for row in rows:
+            if row.get("source") != "ds3_members":
                 continue
+            candidate_id = row.get("candidate_id", "")
+            if candidate_id:
+                self.parsed_resume_map[candidate_id] = row
 
-            member_meta = item.get("metadata", {})
-            rebuilt_metadata.append(
-                {
-                    "filename": item.get("filename", ""),
-                    "file_path": item.get("file_path", ""),
-                    "text": item.get("text", ""),
-                    "source": item.get("source", "ds3_members"),
-                    "full_name": member_meta.get("full_name", ""),
-                    "major": member_meta.get("major", ""),
-                    "graduation_year": str(member_meta.get("graduation_year", "")),
-                    "resume_link": member_meta.get("resume_link", ""),
-                    "linkedin": member_meta.get("linkedin", ""),
-                    "github": member_meta.get("github", ""),
-                }
-            )
+    def _load_chunk_records(self):
+        if not RESUME_CHUNKS_PATH.exists():
+            return
+        with open(RESUME_CHUNKS_PATH, "r", encoding="utf-8") as f:
+            rows = json.load(f)
 
-        if not rebuilt_metadata:
-            raise ValueError("Could not rebuild member metadata from fallback resume data.")
+        self.chunk_candidates = [row for row in rows if row.get("source") == "ds3_members"]
+        self._prepare_chunk_text_index()
 
-        return rebuilt_metadata
+    def _load_resume_metadata(self):
+        if not METADATA_PATH.exists():
+            return
+        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+        self.resume_metadata = [row for row in rows if row.get("source") == "ds3_members"]
+        self.resume_metadata_by_filename = {
+            row.get("filename", ""): row for row in self.resume_metadata if row.get("filename")
+        }
 
-    def _load_ds3_fallback(self):
-        if not FALLBACK_RESUME_PATH.exists():
-            raise FileNotFoundError(f"Fallback resume data not found at {FALLBACK_RESUME_PATH}")
+    def _load_semantic_backend(self):
+        try:
+            import faiss
+            from sentence_transformers import SentenceTransformer
+        except Exception:
+            self.retrieval_backend = "lexical-chunk"
+            return
 
-        with open(FALLBACK_RESUME_PATH, "r") as f:
-            raw_resumes = json.load(f)
+        if not FAISS_INDEX_PATH.exists():
+            self.retrieval_backend = "lexical-chunk"
+            return
 
-        if MEMBERS_CSV.exists():
-            self.members_df = pd.read_csv(MEMBERS_CSV)
-            self._build_member_index()
+        metadata_rows = None
+        metadata_kind = None
+        if CHUNK_METADATA_PATH.exists():
+            with open(CHUNK_METADATA_PATH, "r", encoding="utf-8") as f:
+                metadata_rows = json.load(f)
+            metadata_kind = "chunk"
+        elif METADATA_PATH.exists():
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                metadata_rows = json.load(f)
+            metadata_kind = "resume"
+
+        if metadata_rows is None:
+            self.retrieval_backend = "lexical-chunk"
+            return
 
         try:
-            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(MODEL_NAME, local_files_only=True)
+            index = faiss.read_index(str(FAISS_INDEX_PATH))
+        except Exception:
+            self.retrieval_backend = "lexical-chunk"
+            return
 
-            self.model = SentenceTransformer(MODEL_NAME)
-        except Exception as exc:
-            print(f"[SearchEngine] Could not load fallback embedding model: {exc}")
-            self.model = None
+        if len(metadata_rows) != index.ntotal:
+            self.retrieval_backend = "lexical-chunk"
+            return
 
-        embedding_map = self._load_fallback_embedding_map()
-        ds3_resumes = []
-        fallback_vectors = []
-        for item in raw_resumes:
-            if item.get("source") != "ds3_members":
-                continue
-
-            member_meta = item.get("metadata", {})
-            filename = item.get("filename", "")
-            ds3_resumes.append(
-                {
-                    "filename": filename,
-                    "file_path": item.get("file_path", ""),
-                    "text": item.get("text", ""),
-                    "source": item.get("source", "ds3_members"),
-                    "full_name": member_meta.get("full_name", ""),
-                    "major": member_meta.get("major", ""),
-                    "graduation_year": str(member_meta.get("graduation_year", "")),
-                    "resume_link": member_meta.get("resume_link", ""),
-                    "linkedin": member_meta.get("linkedin", ""),
-                    "github": member_meta.get("github", ""),
-                }
-            )
-            if embedding_map is not None:
-                embedding = embedding_map.get(filename)
-                if embedding is not None:
-                    fallback_vectors.append(embedding)
-                else:
-                    fallback_vectors.append(np.zeros(EMBEDDING_DIM, dtype="float32"))
-
-        if not ds3_resumes:
-            raise ValueError("No DS3 resumes found in fallback resume data.")
-
-        self.metadata = ds3_resumes
-        if fallback_vectors and len(fallback_vectors) == len(self.metadata):
-            self.fallback_embeddings = np.vstack(fallback_vectors).astype("float32")
-            norms = np.linalg.norm(self.fallback_embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            self.fallback_embeddings = self.fallback_embeddings / norms
+        self.model = model
+        self.index = index
+        if metadata_kind == "chunk":
+            self.chunk_metadata = [row for row in metadata_rows if row.get("source") == "ds3_members"]
+            self.retrieval_backend = "semantic-chunk"
         else:
-            self.fallback_embeddings = None
-        self._prepare_fallback_text_index()
-        self.demo_mode = True
-        self.mode_label = "Fallback"
-        self.mode_banner = (
-            "FAISS artifacts are unavailable, so TalentLens is using real DS3 resumes "
-            "with fallback search."
-        )
+            self.retrieval_backend = "semantic-resume"
 
     def _load_demo(self):
-        """Generate synthetic data so the UI can be previewed."""
         self.demo_mode = True
         self.mode_label = "Demo"
-        self.mode_banner = (
-            "Pipeline artifacts and fallback DS3 data are unavailable. "
-            "Showing synthetic resumes for UI preview only."
-        )
-
-        if MEMBERS_CSV.exists():
-            self.members_df = pd.read_csv(MEMBERS_CSV)
-
+        self.mode_banner = "No retrieval artifacts found. Showing synthetic demo data."
         demo_names = [
             ("Alice Chen", "Computer Science (B.S.)", "2026"),
             ("Bob Patel", "Data Science (B.S.)", "2027"),
             ("Carol Kim", "Computer Engineering (B.S.)", "2026"),
             ("David Lopez", "Mathematics (B.S.)", "2028"),
-            ("Emily Zhang", "Electrical Engineering (B.S.)", "2027"),
-            ("Frank Johnson", "Computer Science (B.S.)", "2026"),
-            ("Grace Lee", "Data Science (B.S.)", "2027"),
-            ("Hector Rivera", "Statistics (B.S.)", "2028"),
-            ("Ivy Wang", "Computer Science (B.S.)", "2026"),
-            ("Jake Thompson", "Computer Engineering (B.S.)", "2027"),
         ]
-
         skills_pool = [
             "Python, Machine Learning, TensorFlow, SQL, Pandas",
             "Java, React, Node.js, AWS, Docker",
             "C++, Computer Vision, PyTorch, CUDA, OpenCV",
             "R, Statistics, Tableau, Power BI, Excel",
-            "Python, NLP, Transformers, BERT, spaCy",
-            "JavaScript, TypeScript, React, GraphQL, MongoDB",
-            "Python, Deep Learning, Keras, scikit-learn, NumPy",
-            "Spark, Hadoop, Scala, Kafka, Airflow",
-            "Swift, Kotlin, Firebase, REST APIs, Git",
-            "Go, Kubernetes, Terraform, CI/CD, Linux",
         ]
-
-        self.metadata = []
-        for i, ((name, major, grad_year), skills) in enumerate(
-            zip(demo_names, skills_pool)
-        ):
-            self.metadata.append(
+        self.resume_metadata = []
+        for (name, major, grad_year), skills in zip(demo_names, skills_pool):
+            filename = f"{name.replace(' ', '_').lower()}_resume.pdf"
+            self.resume_metadata.append(
                 {
-                    "filename": f"{name.replace(' ', '_').lower()}_resume.pdf",
-                    "file_path": f"data/ds3/member_resumes/{name.replace(' ', '_').lower()}_resume.pdf",
-                    "text": (
-                        f"{name}\n{major} — Class of {grad_year}\n\n"
-                        f"Skills: {skills}\n\n"
-                        "Experience: Software Engineering Intern at Tech Corp. "
-                        "Developed machine learning pipelines for data analysis. "
-                        "Built RESTful APIs and deployed models to production. "
-                        "Published research on natural language processing."
-                    ),
+                    "filename": filename,
+                    "file_path": f"data/ds3/member_resumes/{filename}",
+                    "text": f"{name}\n{major}\nSkills: {skills}",
+                    "source": "demo",
                     "full_name": name,
                     "major": major,
                     "graduation_year": grad_year,
                 }
             )
+        self.resume_metadata_by_filename = {row["filename"]: row for row in self.resume_metadata}
 
     def search(
         self,
@@ -383,150 +312,45 @@ class SearchEngine:
         input_mode: str = "Skills",
         api_key: str | None = None,
     ) -> list[ResumeResult]:
+        del api_key
+        self.last_query_analysis = None
         if self.demo_mode:
-            if self.mode_label == "Fallback":
-                return self._search_fallback(
-                    query,
-                    top_k,
-                    min_score,
-                    skill_filters,
-                    grad_year_filter,
-                    major_filter,
-                    input_mode,
-                    api_key,
-                )
-            return self._search_demo(
-                query, top_k, skill_filters, grad_year_filter, major_filter
-            )
-        return self._search_production(
-            query, top_k, min_score, skill_filters, grad_year_filter, major_filter, input_mode, api_key
-        )
+            return self._search_demo(query, top_k, skill_filters, grad_year_filter, major_filter)
+        if input_mode == "Job Description":
+            return self._search_job_description(query, top_k, min_score, grad_year_filter, major_filter)
+        return self._search_skills(query, top_k, min_score, skill_filters, grad_year_filter, major_filter)
 
-    def _search_production(
+    def _search_job_description(
         self,
         query: str,
         top_k: int,
         min_score: float,
-        skill_filters: list[str] | None,
         grad_year_filter: str | None,
         major_filter: str | None,
-        input_mode: str = "Skills",
-        api_key: str | None = None,
     ) -> list[ResumeResult]:
-        import faiss as _faiss
-
-        # --- Backend Grok Skill Extraction ---
-        if input_mode == "Job Description":
-            extracted_skills = extract_skills_with_grok(query, api_key=api_key)
-            if extracted_skills:
-                # Merge with any existing filters
-                if skill_filters:
-                    skill_filters = list(set(skill_filters + extracted_skills))
-                else:
-                    skill_filters = extracted_skills
-
-        query_embedding = self.model.encode([query]).astype("float32")
-        _faiss.normalize_L2(query_embedding)
-
-        # Increase fetch window to allow boosted resumes to climb from further down
-        fetch_k = max(100, min(top_k * 10, len(self.metadata)))
-        scores, indices = self.index.search(query_embedding, fetch_k)
-
-        query_skills = [s.strip() for s in query.split(",") if s.strip()]
-        if skill_filters:
-            query_skills = list(set(query_skills + skill_filters))
-
-        # Check for prominent companies in the query/JD to apply extra emphasis
-        target_companies = ["amazon", "google", "meta", "microsoft", "apple", "netflix"]
-        jd_companies = [c for c in target_companies if c in query.lower()]
-
-        results: list[ResumeResult] = []
-        for idx, score in zip(indices[0], scores[0]):
-            if idx < 0 or score < min_score:
-                continue
-            meta = self.metadata[idx]
-            text = meta.get("text", "")
-            matched = extract_matched_skills(text, query_skills) if query_skills else []
-
-            # --- Score Boosting ---
-            final_score = float(score)
-            if query_skills and matched:
-                match_ratio = len(matched) / len(query_skills)
-                final_score += (0.2 * match_ratio)
-                
-                # HUGE boost for target company match if it's the subject of the search
-                for company in jd_companies:
-                    # Check for variations like AWS for Amazon
-                    is_match = company in text.lower() or (company == "amazon" and "aws" in text.lower())
-                    
-                    if is_match:
-                        # massive boost to prioritize past experience at the same company
-                        final_score += 0.3
-                        # Extra boost for specific career-starting roles (Intern/SDE/Internship)
-                        # We use multiline regex with a slightly larger window
-                        role_pattern = rf"(intern|sde|engineer|researcher|analyst)[\s\S]{{0,100}}\b({company}|aws)\b"
-                        if re.search(role_pattern, text.lower(), re.I):
-                             final_score += 0.3
-                             # Specific higher priority for Interns/SDEs per user request
-                             if re.search(rf"(intern|sde)[\s\S]{{0,50}}\b({company}|aws)\b", text.lower(), re.I):
-                                 final_score += 0.2
-                        elif re.search(rf"\b({company}|aws)\b[\s\S]{{0,100}}\b(intern|sde|engineer|researcher|analyst)\b", text.lower(), re.I):
-                             final_score += 0.3
-                             # Specific higher priority for Interns/SDEs per user request
-                             if re.search(rf"\b({company}|aws)\b[\s\S]{{0,50}}\b(intern|sde)\b", text.lower(), re.I):
-                                 final_score += 0.2
-                
-                final_score = min(final_score, 1.8) # Allow ranking to go higher
-                         
-
-            member_info = self._lookup_member(meta.get("filename", ""), text)
-
-            if grad_year_filter and member_info.get("graduation_year", "") != grad_year_filter:
-                continue
-            if major_filter and major_filter.lower() not in member_info.get("major", "").lower():
-                continue
-
-            results.append(
-                ResumeResult(
-                    rank=0,
-                    filename=meta.get("filename", ""),
-                    score=final_score,
-                    semantic_score=float(score),
-                    file_path=meta.get("file_path", ""),
-                    local_resume_path=self._resolve_resume_path(
-                        meta.get("filename", ""),
-                        meta.get("file_path", ""),
-                    ),
-                    text_preview=text[:400],
-                    full_text=text,
-                    source=meta.get("source", "ds3_members"),
-                    full_name=member_info.get("full_name", meta.get("filename", "")),
-                    major=member_info.get("major", ""),
-                    graduation_year=member_info.get("graduation_year", ""),
-                    resume_link=member_info.get("resume_link", ""),
-                    linkedin=member_info.get("linkedin", ""),
-                    github=member_info.get("github", ""),
-                    matched_skills=matched,
-                    ranking_details={
-                        "mode": "semantic_search",
-                        "base_search_score": float(score),
-                        "matched_skill_count": len(matched),
-                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
-                    },
-                )
-            )
-
-        results.sort(key=lambda x: x.score, reverse=True)
-        if input_mode == "Job Description":
-            results = self._apply_recruiter_reranking(results, query, api_key)
-        results = results[:top_k]
-
-        for i, r in enumerate(results, 1):
-            r.rank = i
-
+        parsed = parse_job_description(query)
+        chunk_fetch_k = max(50, min(100, top_k * 5))
+        chunk_hits = self._retrieve_chunks(query, parsed, top_k=chunk_fetch_k)
+        results = self._aggregate_chunk_hits(
+            chunk_hits=chunk_hits,
+            parsed=parsed,
+            top_k=top_k,
+            min_score=min_score,
+            grad_year_filter=grad_year_filter,
+            major_filter=major_filter,
+        )
+        self.last_query_analysis = {
+            **parsed.to_dict(),
+            "retrieval": {
+                "backend": self.retrieval_backend,
+                "top_k_chunks": chunk_fetch_k,
+                "retrieved_chunks": len(chunk_hits),
+                "shortlisted_candidates": len(results),
+            },
+        }
         return results
 
-    def _search_fallback(
+    def _search_skills(
         self,
         query: str,
         top_k: int,
@@ -534,69 +358,35 @@ class SearchEngine:
         skill_filters: list[str] | None,
         grad_year_filter: str | None,
         major_filter: str | None,
-        input_mode: str = "Skills",
-        api_key: str | None = None,
     ) -> list[ResumeResult]:
-        if input_mode == "Job Description":
-            extracted_skills = extract_skills_with_grok(query, api_key=api_key)
-            if extracted_skills:
-                skill_filters = list(set((skill_filters or []) + extracted_skills))
-
         query_skills = [s.strip() for s in query.split(",") if s.strip()]
         if skill_filters:
-            query_skills = list(set(query_skills + skill_filters))
+            query_skills = list(dict.fromkeys(query_skills + skill_filters))
 
-        lexical_scores = self._score_fallback_lexical(query, query_skills)
-        if self.model is not None and self.fallback_embeddings is not None:
-            query_embedding = self.model.encode([query]).astype("float32")
-            query_norm = np.linalg.norm(query_embedding, axis=1, keepdims=True)
-            query_norm[query_norm == 0] = 1.0
-            query_embedding = query_embedding / query_norm
-            cosine_scores = np.clip(np.dot(self.fallback_embeddings, query_embedding[0]), 0.0, 1.0)
-            base_scores = (0.75 * cosine_scores) + (0.25 * lexical_scores)
-        else:
-            base_scores = lexical_scores
-
-        target_companies = ["amazon", "google", "meta", "microsoft", "apple", "netflix"]
-        jd_companies = [c for c in target_companies if c in query.lower()]
-
-        scored = []
-        for meta, score in zip(self.metadata, base_scores):
-            text = meta.get("text", "")
-            member_info = self._lookup_member(meta.get("filename", ""), text)
+        scored_rows: list[ResumeResult] = []
+        scores = self._resume_scores(query, query_skills)
+        for meta, raw_score in zip(self.resume_metadata, scores):
+            if raw_score < min_score:
+                continue
+            member_info = self._lookup_member(meta.get("filename", ""), meta.get("text", ""))
             grad_year = member_info.get("graduation_year", meta.get("graduation_year", ""))
             major = member_info.get("major", meta.get("major", ""))
-
-            if grad_year_filter and grad_year != grad_year_filter:
+            if grad_year_filter and str(grad_year) != grad_year_filter:
                 continue
             if major_filter and major_filter.lower() not in str(major).lower():
                 continue
-
+            text = meta.get("text", "")
             matched = extract_matched_skills(text, query_skills) if query_skills else []
-            final_score = float(score)
-            if query_skills and matched:
-                match_ratio = len(matched) / len(query_skills)
-                final_score += 0.2 * match_ratio
-
-                for company in jd_companies:
-                    is_match = company in text.lower() or (company == "amazon" and "aws" in text.lower())
-                    if is_match:
-                        final_score += 0.18
-
-            if final_score < min_score:
-                continue
-
-            scored.append(
+            final_score = min(1.0, float(raw_score) + (0.12 * len(matched) / max(len(query_skills), 1)))
+            scored_rows.append(
                 ResumeResult(
                     rank=0,
                     filename=meta.get("filename", ""),
-                    score=min(final_score, RECRUITER_MAX_SCORE),
-                    semantic_score=float(score),
+                    candidate_id=meta.get("filename", ""),
+                    score=final_score,
+                    semantic_score=float(raw_score),
                     file_path=meta.get("file_path", ""),
-                    local_resume_path=self._resolve_resume_path(
-                        meta.get("filename", ""),
-                        meta.get("file_path", ""),
-                    ),
+                    local_resume_path=self._resolve_resume_path(meta.get("filename", ""), meta.get("file_path", "")),
                     text_preview=text[:400],
                     full_text=text,
                     source=meta.get("source", "ds3_members"),
@@ -607,24 +397,483 @@ class SearchEngine:
                     linkedin=member_info.get("linkedin", meta.get("linkedin", "")),
                     github=member_info.get("github", meta.get("github", "")),
                     matched_skills=matched,
+                    top_evidence_chunks=[
+                        {
+                            "section_type": "resume",
+                            "score": round(float(raw_score), 4),
+                            "text": text[:300],
+                        }
+                    ],
                     ranking_details={
-                        "mode": "fallback_search",
-                        "base_search_score": float(score),
+                        "mode": "skill_search",
+                        "retrieval_backend": self.retrieval_backend,
+                        "base_search_score": round(float(raw_score), 4),
                         "matched_skill_count": len(matched),
-                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
                     },
                 )
             )
 
-        scored.sort(key=lambda item: item.score, reverse=True)
-        if input_mode == "Job Description":
-            scored = self._apply_recruiter_reranking(scored, query, api_key)
-        scored = scored[:top_k]
-
-        for i, result in enumerate(scored, 1):
+        scored_rows.sort(key=lambda item: item.score, reverse=True)
+        for i, result in enumerate(scored_rows[:top_k], 1):
             result.rank = i
+        return scored_rows[:top_k]
 
-        return scored
+    def _retrieve_chunks(self, query: str, parsed: ParsedJobDescription, top_k: int) -> list[ChunkHit]:
+        if self.retrieval_backend == "semantic-chunk" and self.index is not None and self.model is not None and self.chunk_metadata:
+            return self._semantic_chunk_search(query, top_k)
+        if self.chunk_candidates:
+            return self._lexical_chunk_search(query, parsed, top_k)
+        return self._resume_as_chunk_search(query, top_k)
+
+    def _semantic_chunk_search(self, query: str, top_k: int) -> list[ChunkHit]:
+        import faiss as _faiss
+
+        query_embedding = self.model.encode([query], normalize_embeddings=True).astype("float32")
+        _faiss.normalize_L2(query_embedding)
+        scores, indices = self.index.search(query_embedding, top_k)
+
+        hits: list[ChunkHit] = []
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < 0:
+                continue
+            row = self.chunk_metadata[idx]
+            hits.append(
+                ChunkHit(
+                    candidate_id=row.get("candidate_id", ""),
+                    chunk_id=row.get("chunk_id", ""),
+                    section_type=row.get("section_type", "other"),
+                    text=row.get("text", ""),
+                    score=float(max(0.0, score)) * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
+                    source=row.get("source", "ds3_members"),
+                )
+            )
+        return hits
+
+    def _lexical_chunk_search(self, query: str, parsed: ParsedJobDescription, top_k: int) -> list[ChunkHit]:
+        query_skills = list(dict.fromkeys(parsed.must_have_skills + parsed.preferred_skills))
+        scores = self._score_bm25(
+            docs=self.chunk_candidates,
+            term_frequencies=self.chunk_term_frequencies,
+            doc_lengths=self.chunk_doc_lengths,
+            avg_doc_length=self.chunk_avg_doc_length,
+            idf_map=self.chunk_idf,
+            query=query,
+            query_skills=query_skills,
+        )
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
+        hits: list[ChunkHit] = []
+        for idx in ranked_indices:
+            score = float(scores[idx])
+            if score <= 0:
+                continue
+            row = self.chunk_candidates[int(idx)]
+            hits.append(
+                ChunkHit(
+                    candidate_id=row.get("candidate_id", ""),
+                    chunk_id=row.get("chunk_id", ""),
+                    section_type=row.get("section_type", "other"),
+                    text=row.get("text", ""),
+                    score=score * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
+                    source=row.get("source", "ds3_members"),
+                )
+            )
+        return hits
+
+    def _resume_as_chunk_search(self, query: str, top_k: int) -> list[ChunkHit]:
+        scores = self._resume_scores(query, [])
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
+        hits: list[ChunkHit] = []
+        for idx in ranked_indices:
+            row = self.resume_metadata[int(idx)]
+            hits.append(
+                ChunkHit(
+                    candidate_id=row.get("filename", ""),
+                    chunk_id=row.get("filename", ""),
+                    section_type="resume",
+                    text=row.get("text", "")[:500],
+                    score=float(scores[idx]),
+                    source=row.get("source", "ds3_members"),
+                )
+            )
+        return hits
+
+    def _aggregate_chunk_hits(
+        self,
+        chunk_hits: list[ChunkHit],
+        parsed: ParsedJobDescription,
+        top_k: int,
+        min_score: float,
+        grad_year_filter: str | None,
+        major_filter: str | None,
+    ) -> list[ResumeResult]:
+        grouped: dict[str, list[ChunkHit]] = {}
+        for hit in chunk_hits:
+            if not hit.candidate_id:
+                continue
+            grouped.setdefault(hit.candidate_id, []).append(hit)
+
+        results: list[ResumeResult] = []
+        for candidate_id, hits in grouped.items():
+            hits.sort(key=lambda item: item.score, reverse=True)
+            profile = self._get_candidate_profile(candidate_id)
+            if not profile:
+                continue
+            filter_status = self._evaluate_hard_filters(profile, parsed, grad_year_filter, major_filter)
+            if not filter_status["passed"]:
+                continue
+
+            must_have_count = len(filter_status["matched_must_have_skills"])
+            preferred_count = len(filter_status["matched_preferred_skills"])
+            best_score = hits[0].score
+            mean_top_scores = float(np.mean([hit.score for hit in hits[:3]]))
+            must_have_ratio = 1.0
+            if parsed.must_have_skills:
+                must_have_ratio = must_have_count / max(len(parsed.must_have_skills), 1)
+            preferred_ratio = 0.0
+            if parsed.preferred_skills:
+                preferred_ratio = preferred_count / max(len(parsed.preferred_skills), 1)
+
+            combined_score = min(
+                1.0,
+                (0.62 * best_score)
+                + (0.23 * mean_top_scores)
+                + (0.10 * must_have_ratio)
+                + (0.05 * preferred_ratio),
+            )
+            if combined_score < min_score:
+                continue
+
+            member_info = self._lookup_member(candidate_id, profile.get("combined_text", ""))
+            display_meta = self.resume_metadata_by_filename.get(candidate_id, {})
+            top_evidence = [
+                {
+                    "section_type": hit.section_type,
+                    "score": round(hit.score, 4),
+                    "text": hit.text,
+                }
+                for hit in hits[:3]
+            ]
+            matched_skills = sorted(
+                set(filter_status["matched_must_have_skills"] + filter_status["matched_preferred_skills"])
+            )
+
+            results.append(
+                ResumeResult(
+                    rank=0,
+                    filename=candidate_id,
+                    candidate_id=candidate_id,
+                    score=combined_score,
+                    semantic_score=best_score,
+                    file_path=display_meta.get("file_path", profile.get("file_path", "")),
+                    local_resume_path=self._resolve_resume_path(candidate_id, display_meta.get("file_path", profile.get("file_path", ""))),
+                    text_preview=hits[0].text[:400],
+                    full_text=profile.get("combined_text", ""),
+                    source=profile.get("source", "ds3_members"),
+                    full_name=member_info.get("full_name", profile.get("full_name", candidate_id)),
+                    major=member_info.get("major", profile.get("major", "")),
+                    graduation_year=str(member_info.get("graduation_year", profile.get("graduation_year", ""))),
+                    resume_link=member_info.get("resume_link", profile.get("resume_link", "")),
+                    linkedin=member_info.get("linkedin", profile.get("linkedin", "")),
+                    github=member_info.get("github", profile.get("github", "")),
+                    matched_skills=matched_skills,
+                    top_evidence_chunks=top_evidence,
+                    hard_filter_status=filter_status,
+                    ranking_details={
+                        "mode": "job_description_retrieval",
+                        "retrieval_backend": self.retrieval_backend,
+                        "base_search_score": round(best_score, 4),
+                        "mean_top_chunk_score": round(mean_top_scores, 4),
+                        "evidence_chunk_count": len(hits),
+                        "matched_must_have_count": must_have_count,
+                        "total_must_have_count": len(parsed.must_have_skills),
+                        "matched_preferred_count": preferred_count,
+                        "total_preferred_count": len(parsed.preferred_skills),
+                    },
+                )
+            )
+
+        results.sort(key=lambda item: item.score, reverse=True)
+        for i, result in enumerate(results[:top_k], 1):
+            result.rank = i
+        return results[:top_k]
+
+    def _evaluate_hard_filters(
+        self,
+        profile: dict,
+        parsed: ParsedJobDescription,
+        grad_year_filter: str | None,
+        major_filter: str | None,
+    ) -> dict:
+        combined_text = profile.get("combined_text", "")
+        matched_must_have = extract_matched_skills(combined_text, parsed.must_have_skills)
+        matched_preferred = extract_matched_skills(combined_text, parsed.preferred_skills)
+
+        status = {
+            "passed": True,
+            "matched_must_have_skills": matched_must_have,
+            "matched_preferred_skills": matched_preferred,
+            "minimum_years_required": parsed.minimum_years_experience,
+            "candidate_years_experience": profile.get("estimated_years_experience"),
+            "years_experience_status": "not_requested",
+            "degree_requirements": parsed.degree_requirements,
+            "degree_status": "not_requested",
+            "location": parsed.location,
+            "remote_policy": parsed.remote_policy,
+            "location_status": "not_requested",
+        }
+
+        if grad_year_filter and str(profile.get("graduation_year", "")) != grad_year_filter:
+            status["passed"] = False
+            status["graduation_year_status"] = "failed"
+        else:
+            status["graduation_year_status"] = "passed" if grad_year_filter else "not_requested"
+
+        if major_filter and major_filter.lower() not in str(profile.get("major", "")).lower():
+            status["passed"] = False
+            status["major_status"] = "failed"
+        else:
+            status["major_status"] = "passed" if major_filter else "not_requested"
+
+        if parsed.must_have_skills:
+            if len(matched_must_have) < len(parsed.must_have_skills):
+                status["passed"] = False
+                status["must_have_status"] = "failed"
+            else:
+                status["must_have_status"] = "passed"
+        else:
+            status["must_have_status"] = "not_requested"
+
+        candidate_years = profile.get("estimated_years_experience")
+        if parsed.minimum_years_experience is not None:
+            if candidate_years is None:
+                status["years_experience_status"] = "unknown"
+            elif candidate_years + 0.25 < parsed.minimum_years_experience:
+                status["passed"] = False
+                status["years_experience_status"] = "failed"
+            else:
+                status["years_experience_status"] = "passed"
+
+        if parsed.degree_requirements:
+            degree_rank = self._highest_degree_rank(profile)
+            required_rank = max(self._degree_rank(req) for req in parsed.degree_requirements)
+            if degree_rank == 0:
+                status["degree_status"] = "unknown"
+            elif degree_rank < required_rank:
+                status["passed"] = False
+                status["degree_status"] = "failed"
+            else:
+                status["degree_status"] = "passed"
+
+        if parsed.location:
+            location_text = str(profile.get("location_text", ""))
+            if not location_text:
+                status["location_status"] = "unknown"
+            elif parsed.remote_policy.lower() == "remote":
+                status["location_status"] = "remote_ok"
+            elif parsed.location.lower() in location_text.lower():
+                status["location_status"] = "passed"
+            else:
+                status["location_status"] = "unknown"
+
+        return status
+
+    def _get_candidate_profile(self, candidate_id: str) -> dict:
+        parsed = self.parsed_resume_map.get(candidate_id, {})
+        meta = self.resume_metadata_by_filename.get(candidate_id, {})
+        metadata = parsed.get("metadata", {}) if isinstance(parsed.get("metadata"), dict) else {}
+        text_parts = []
+        if meta.get("text"):
+            text_parts.append(meta["text"])
+        for key in ("summary", "skills", "projects", "certifications"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                text_parts.append("\n".join(str(item) for item in value))
+            elif value:
+                text_parts.append(str(value))
+        for section_key in ("experience", "education", "projects"):
+            for item in parsed.get(section_key, []):
+                if isinstance(item, dict) and item.get("raw_text"):
+                    text_parts.append(item["raw_text"])
+
+        full_name = metadata.get("full_name", meta.get("full_name", candidate_id))
+        major = metadata.get("major", meta.get("major", ""))
+        graduation_year = str(metadata.get("graduation_year", meta.get("graduation_year", "")))
+        profile = {
+            "candidate_id": candidate_id,
+            "file_path": meta.get("file_path", parsed.get("file_path", "")),
+            "source": meta.get("source", parsed.get("source", "ds3_members")),
+            "full_name": full_name,
+            "major": major,
+            "graduation_year": graduation_year,
+            "resume_link": metadata.get("resume_link", meta.get("resume_link", "")),
+            "linkedin": metadata.get("linkedin", meta.get("linkedin", "")),
+            "github": metadata.get("github", meta.get("github", "")),
+            "skills": parsed.get("skills", []),
+            "education": parsed.get("education", []),
+            "location_text": (meta.get("text", "")[:300] if meta.get("text") else ""),
+            "combined_text": "\n".join(part for part in text_parts if part),
+            "estimated_years_experience": self._estimate_years_experience(parsed.get("experience", [])),
+        }
+        return profile
+
+    def _estimate_years_experience(self, experience_entries: list[dict]) -> float | None:
+        if not experience_entries:
+            return None
+        month_map = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        spans: list[tuple[int, int]] = []
+        current_index = 2026 * 12 + 3
+        for entry in experience_entries:
+            dates = entry.get("dates", []) if isinstance(entry, dict) else []
+            pairs = []
+            for date_text in dates:
+                parts = re.findall(r"([A-Za-z]{3,9})\.?\s+(\d{4})", str(date_text))
+                for month_name, year_text in parts:
+                    month = month_map.get(month_name[:3].lower())
+                    if month:
+                        pairs.append(int(year_text) * 12 + month)
+            if len(pairs) >= 2:
+                pairs.sort()
+                spans.append((pairs[0], pairs[-1]))
+            elif len(pairs) == 1:
+                spans.append((pairs[0], current_index))
+        if not spans:
+            return None
+        spans.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in spans:
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        total_months = sum(max(0, end - start) for start, end in merged)
+        return round(total_months / 12.0, 1) if total_months > 0 else None
+
+    def _highest_degree_rank(self, profile: dict) -> int:
+        education_text = "\n".join(
+            item.get("raw_text", "") for item in profile.get("education", []) if isinstance(item, dict)
+        )
+        combined = f"{profile.get('major', '')}\n{education_text}".lower()
+        if re.search(r"\b(phd|doctorate)\b", combined):
+            return 3
+        if re.search(r"\b(master|m\.s|m\.a)\b", combined):
+            return 2
+        if re.search(r"\b(bachelor|b\.s|b\.a)\b", combined):
+            return 1
+        return 0
+
+    def _degree_rank(self, requirement: str) -> int:
+        req = requirement.lower()
+        if "phd" in req:
+            return 3
+        if "master" in req:
+            return 2
+        if "bachelor" in req:
+            return 1
+        return 0
+
+    def _prepare_chunk_text_index(self):
+        self.chunk_term_frequencies = []
+        self.chunk_doc_lengths = []
+        self.chunk_idf = {}
+        self.chunk_avg_doc_length = 0.0
+        if not self.chunk_candidates:
+            return
+        self.chunk_term_frequencies, self.chunk_doc_lengths, self.chunk_idf, self.chunk_avg_doc_length = self._build_text_index(self.chunk_candidates)
+
+    def _prepare_resume_text_index(self):
+        self.resume_term_frequencies = []
+        self.resume_doc_lengths = []
+        self.resume_idf = {}
+        self.resume_avg_doc_length = 0.0
+        if not self.resume_metadata:
+            return
+        self.resume_term_frequencies, self.resume_doc_lengths, self.resume_idf, self.resume_avg_doc_length = self._build_text_index(self.resume_metadata)
+
+    def _build_text_index(self, rows: list[dict]):
+        term_frequencies: list[dict[str, int]] = []
+        doc_lengths: list[int] = []
+        document_frequency: dict[str, int] = {}
+        for row in rows:
+            tokens = _tokenize_text(row.get("text", ""))
+            counts: dict[str, int] = {}
+            for token in tokens:
+                counts[token] = counts.get(token, 0) + 1
+            term_frequencies.append(counts)
+            doc_lengths.append(len(tokens))
+            for token in counts:
+                document_frequency[token] = document_frequency.get(token, 0) + 1
+        num_docs = len(rows)
+        avg_doc_length = sum(doc_lengths) / max(num_docs, 1)
+        idf = {
+            token: math.log(1 + (num_docs - df + 0.5) / (df + 0.5))
+            for token, df in document_frequency.items()
+        }
+        return term_frequencies, doc_lengths, idf, avg_doc_length
+
+    def _score_bm25(
+        self,
+        docs: list[dict],
+        term_frequencies: list[dict[str, int]],
+        doc_lengths: list[int],
+        avg_doc_length: float,
+        idf_map: dict[str, float],
+        query: str,
+        query_skills: list[str],
+    ) -> np.ndarray:
+        if not docs:
+            return np.array([], dtype="float32")
+        query_tokens = _tokenize_text(query)
+        for skill in query_skills:
+            query_tokens.extend(_tokenize_text(skill))
+        query_terms = list(dict.fromkeys(query_tokens))
+        if not query_terms:
+            return np.zeros(len(docs), dtype="float32")
+
+        scores = np.zeros(len(docs), dtype="float32")
+        k1 = 1.5
+        b = 0.75
+        for i, (row, tf, doc_length) in enumerate(zip(docs, term_frequencies, doc_lengths)):
+            score = 0.0
+            for term in query_terms:
+                freq = tf.get(term, 0)
+                if freq == 0:
+                    continue
+                idf = idf_map.get(term, 0.0)
+                denom = freq + k1 * (1 - b + b * doc_length / max(avg_doc_length, 1.0))
+                score += idf * ((freq * (k1 + 1)) / max(denom, 1e-6))
+            lower_text = row.get("text", "").lower()
+            for skill in query_skills:
+                if skill.lower() in lower_text:
+                    score += 0.75
+            scores[i] = score
+        max_score = float(scores.max()) if len(scores) else 0.0
+        if max_score > 0:
+            scores = scores / max_score
+        return scores
+
+    def _resume_scores(self, query: str, query_skills: list[str]) -> np.ndarray:
+        if self.retrieval_backend == "semantic-resume" and self.index is not None and self.model is not None and self.resume_metadata:
+            import faiss as _faiss
+            query_embedding = self.model.encode([query], normalize_embeddings=True).astype("float32")
+            _faiss.normalize_L2(query_embedding)
+            scores, indices = self.index.search(query_embedding, len(self.resume_metadata))
+            dense = np.zeros(len(self.resume_metadata), dtype="float32")
+            for idx, score in zip(indices[0], scores[0]):
+                if idx >= 0:
+                    dense[idx] = max(0.0, float(score))
+            return dense
+        return self._score_bm25(
+            docs=self.resume_metadata,
+            term_frequencies=self.resume_term_frequencies,
+            doc_lengths=self.resume_doc_lengths,
+            avg_doc_length=self.resume_avg_doc_length,
+            idf_map=self.resume_idf,
+            query=query,
+            query_skills=query_skills,
+        )
 
     def _search_demo(
         self,
@@ -634,169 +883,45 @@ class SearchEngine:
         grad_year_filter: str | None,
         major_filter: str | None,
     ) -> list[ResumeResult]:
-        """Simple text-overlap scoring for demo purposes."""
-        query_lower = query.lower()
-        query_tokens = set(re.findall(r"\w+", query_lower))
-
         query_skills = [s.strip() for s in query.split(",") if s.strip()]
         if skill_filters:
-            query_skills = list(set(query_skills + skill_filters))
-        if not query_tokens and skill_filters:
-            for sf in skill_filters:
-                query_tokens.update(re.findall(r"\w+", sf.lower()))
-
-        scored = []
-        for meta in self.metadata:
-            text = meta.get("text", "")
-            text_lower = text.lower()
-            text_tokens = set(re.findall(r"\w+", text_lower))
-            overlap = len(query_tokens & text_tokens)
-            score = overlap / max(len(query_tokens), 1)
-
-            grad_year = meta.get("graduation_year", "")
-            major = meta.get("major", "")
-
-            if grad_year_filter and str(grad_year) != grad_year_filter:
-                continue
-            if major_filter and major_filter.lower() not in major.lower():
-                continue
-
-            matched = extract_matched_skills(text, query_skills) if query_skills else []
-            if skill_filters and not matched:
-                score *= 0.3
-
-            scored.append((meta, score, matched))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-
+            query_skills = list(dict.fromkeys(query_skills + skill_filters))
+        query_tokens = set(_tokenize_text(query))
         results: list[ResumeResult] = []
-        for i, (meta, score, matched) in enumerate(scored[:top_k], 1):
+        for meta in self.resume_metadata:
+            text = meta.get("text", "")
+            overlap = len(query_tokens & set(_tokenize_text(text)))
+            score = overlap / max(len(query_tokens), 1) if query_tokens else 0.0
+            if grad_year_filter and str(meta.get("graduation_year", "")) != grad_year_filter:
+                continue
+            if major_filter and major_filter.lower() not in str(meta.get("major", "")).lower():
+                continue
+            matched = extract_matched_skills(text, query_skills)
             results.append(
                 ResumeResult(
-                    rank=i,
+                    rank=0,
                     filename=meta.get("filename", ""),
-                    score=min(score, 1.0),
-                    semantic_score=min(score, 1.0),
+                    candidate_id=meta.get("filename", ""),
+                    score=score,
+                    semantic_score=score,
                     file_path=meta.get("file_path", ""),
-                    local_resume_path=self._resolve_resume_path(
-                        meta.get("filename", ""),
-                        meta.get("file_path", ""),
-                    ),
-                    text_preview=meta.get("text", "")[:400],
-                    full_text=meta.get("text", ""),
+                    local_resume_path="",
+                    text_preview=text[:400],
+                    full_text=text,
                     source="demo",
                     full_name=meta.get("full_name", meta.get("filename", "")),
                     major=meta.get("major", ""),
                     graduation_year=meta.get("graduation_year", ""),
-                    resume_link="",
-                    linkedin="",
-                    github="",
                     matched_skills=matched,
-                    ranking_details={
-                        "mode": "demo_search",
-                        "base_search_score": float(score),
-                        "matched_skill_count": len(matched),
-                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
-                    },
+                    ranking_details={"mode": "demo_search", "base_search_score": round(score, 4)},
                 )
             )
-        return results
-
-    def _apply_recruiter_reranking(
-        self,
-        results: list[ResumeResult],
-        job_description: str,
-        api_key: str | None = None,
-    ) -> list[ResumeResult]:
-        rerank_count = min(RECRUITER_RERANK_LIMIT, len(results))
-        if rerank_count == 0:
-            return results
-
-        def _assess_one(result: ResumeResult) -> tuple[ResumeResult, dict, dict]:
-            candidate_text = result.full_text or result.text_preview
-            candidate_name = result.full_name or result.filename
-            recruiter = assess_candidate_with_grok(
-                job_description=job_description,
-                candidate_text=candidate_text,
-                candidate_name=candidate_name,
-                api_key=api_key,
-            )
-            rubric = assess_resume_quality_with_grok(
-                job_description=job_description,
-                candidate_text=candidate_text,
-                candidate_name=candidate_name,
-                api_key=api_key,
-            )
-            return result, recruiter, rubric
-
-        # Fire all candidate assessments concurrently — collapses
-        # (rerank_count × 2 × latency) sequential calls down to ~(2 × latency).
-        with ThreadPoolExecutor(max_workers=rerank_count) as executor:
-            futures = {
-                executor.submit(_assess_one, r): r
-                for r in results[:rerank_count]
-            }
-            for future in as_completed(futures):
-                result, recruiter_assessment, rubric_assessment = future.result()
-
-                recruiter_signal = (
-                    (recruiter_assessment.get("impact_score", 0.0) * 0.35)
-                    + (recruiter_assessment.get("technology_fit_score", 0.0) * 0.35)
-                    + (recruiter_assessment.get("keyword_alignment_score", 0.0) * 0.20)
-                    + (recruiter_assessment.get("role_fit_score", 0.0) * 0.10)
-                ) / 10.0
-                quality_signal = (
-                    (rubric_assessment.get("ats_format_score", 0.0) * 0.18)
-                    + (rubric_assessment.get("section_quality_score", 0.0) * 0.12)
-                    + (rubric_assessment.get("bullet_quality_score", 0.0) * 0.20)
-                    + (rubric_assessment.get("technical_relevance_score", 0.0) * 0.22)
-                    + (rubric_assessment.get("truthfulness_score", 0.0) * 0.18)
-                    + (rubric_assessment.get("project_strength_score", 0.0) * 0.10)
-                ) / 10.0
-                base_signal = min(result.score / RECRUITER_MAX_SCORE, 1.0)
-                hard_fail_flags = rubric_assessment.get("hard_fail_flags", [])
-                revision_flags = rubric_assessment.get("revision_flags", [])
-                penalty = min(
-                    0.45,
-                    (0.12 * len(hard_fail_flags)) + (0.04 * len(revision_flags)),
-                )
-                blended_signal = max(
-                    0.0,
-                    (
-                        (RECRUITER_RERANK_BASE_WEIGHT * base_signal)
-                        + (RECRUITER_RERANK_MATCH_WEIGHT * recruiter_signal)
-                        + (RECRUITER_RERANK_QUALITY_WEIGHT * quality_signal)
-                        - penalty
-                    ),
-                )
-
-                result.recruiter_score = round(recruiter_signal * 10.0, 2)
-                result.recruiter_breakdown = recruiter_assessment
-                result.resume_quality_score = round(quality_signal * 10.0, 2)
-                result.resume_quality_breakdown = rubric_assessment
-                result.resume_flags = revision_flags
-                result.hard_fail_flags = hard_fail_flags
-                result.ranking_details = {
-                    "mode": "recruiter_reranked",
-                    "base_search_score": round(base_signal * 10.0, 2),
-                    "job_match_score": round(recruiter_signal * 10.0, 2),
-                    "resume_quality_score": round(quality_signal * 10.0, 2),
-                    "penalty_applied": round(penalty * 10.0, 2),
-                    "final_blended_score": round(blended_signal * 10.0, 2),
-                    "hard_fail_count": len(hard_fail_flags),
-                    "revision_flag_count": len(revision_flags),
-                }
-                result.score = round(
-                    min(blended_signal * RECRUITER_MAX_SCORE, RECRUITER_MAX_SCORE),
-                    4,
-                )
-
         results.sort(key=lambda item: item.score, reverse=True)
-        return results
+        for i, item in enumerate(results[:top_k], 1):
+            item.rank = i
+        return results[:top_k]
 
-    # ----- helpers ----------------------------------------------------------
     def _build_member_index(self) -> None:
-        """Build a name→meta dict from members_df for O(1) lookups at search time."""
         self._member_index = {}
         if self.members_df is None:
             return
@@ -806,23 +931,17 @@ class SearchEngine:
                 self._member_index[name] = self._row_to_meta(row)
 
     def _lookup_member(self, filename: str, text: str = "") -> dict:
-        """Match a resume filename or text header to a member row using the pre-built index."""
         if not self._member_index:
             return {}
-
-        # 1. Try filename stem match
         name_stem = Path(filename).stem.replace("_", " ").replace("-", " ").lower()
         for name, meta in self._member_index.items():
             if name in name_stem:
                 return meta
-
-        # 2. Try matching name within the first 500 chars of the resume text
         if text:
             text_head = text[:500].lower()
             for name, meta in self._member_index.items():
                 if name in text_head:
                     return meta
-
         return {}
 
     @lru_cache(maxsize=512)
@@ -830,110 +949,13 @@ class SearchEngine:
         candidates: list[Path] = []
         if file_path:
             candidates.append(Path(file_path))
-
         if filename:
             for base_dir in LOCAL_MEMBER_RESUME_DIRS:
                 candidates.append(base_dir / filename)
-
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate.resolve())
-
         return ""
-
-    def _prepare_fallback_text_index(self):
-        self.fallback_term_frequencies = []
-        self.fallback_doc_lengths = []
-        self.fallback_idf = {}
-        self.fallback_avg_doc_length = 0.0
-
-        if not self.metadata:
-            return
-
-        document_frequency: dict[str, int] = {}
-        for meta in self.metadata:
-            tokens = _tokenize_text(meta.get("text", ""))
-            term_counts: dict[str, int] = {}
-            for token in tokens:
-                term_counts[token] = term_counts.get(token, 0) + 1
-            self.fallback_term_frequencies.append(term_counts)
-            self.fallback_doc_lengths.append(len(tokens))
-            for token in term_counts:
-                document_frequency[token] = document_frequency.get(token, 0) + 1
-
-        num_docs = len(self.metadata)
-        self.fallback_avg_doc_length = sum(self.fallback_doc_lengths) / max(num_docs, 1)
-        for token, doc_freq in document_frequency.items():
-            self.fallback_idf[token] = np.log(1 + (num_docs - doc_freq + 0.5) / (doc_freq + 0.5))
-
-    def _score_fallback_lexical(self, query: str, query_skills: list[str]) -> np.ndarray:
-        if not self.metadata:
-            return np.array([], dtype="float32")
-
-        query_tokens = _tokenize_text(query)
-        if query_skills:
-            for skill in query_skills:
-                query_tokens.extend(_tokenize_text(skill))
-        query_terms = list(dict.fromkeys(query_tokens))
-
-        if not query_terms:
-            return np.zeros(len(self.metadata), dtype="float32")
-
-        scores = np.zeros(len(self.metadata), dtype="float32")
-        k1 = 1.5
-        b = 0.75
-
-        for i, (meta, term_counts, doc_length) in enumerate(
-            zip(self.metadata, self.fallback_term_frequencies, self.fallback_doc_lengths)
-        ):
-            score = 0.0
-            for term in query_terms:
-                freq = term_counts.get(term, 0)
-                if freq == 0:
-                    continue
-                idf = self.fallback_idf.get(term, 0.0)
-                denom = freq + k1 * (
-                    1 - b + b * doc_length / max(self.fallback_avg_doc_length, 1.0)
-                )
-                score += idf * ((freq * (k1 + 1)) / max(denom, 1e-6))
-
-            lower_text = meta.get("text", "").lower()
-            for skill in query_skills:
-                if skill and skill.lower() in lower_text:
-                    score += 0.75
-
-            scores[i] = score
-
-        max_score = float(scores.max()) if len(scores) else 0.0
-        if max_score > 0:
-            scores = scores / max_score
-        return scores
-
-    def _load_fallback_embedding_map(self) -> dict[str, np.ndarray] | None:
-        if not FALLBACK_EMBEDDINGS_PATH.exists() or not FALLBACK_EMBEDDING_METADATA_PATH.exists():
-            return None
-
-        try:
-            embeddings = np.load(FALLBACK_EMBEDDINGS_PATH)
-            with open(FALLBACK_EMBEDDING_METADATA_PATH, "r") as f:
-                rows = json.load(f)
-        except Exception as exc:
-            print(f"[SearchEngine] Could not load fallback embeddings: {exc}")
-            return None
-
-        if len(embeddings) != len(rows):
-            print("[SearchEngine] Fallback embeddings do not align with metadata rows.")
-            return None
-
-        embedding_map: dict[str, np.ndarray] = {}
-        for row, embedding in zip(rows, embeddings):
-            if row.get("source") != "ds3_members":
-                continue
-            filename = row.get("filename", "")
-            if filename:
-                embedding_map[filename] = np.asarray(embedding, dtype="float32")
-
-        return embedding_map or None
 
     def _row_to_meta(self, row) -> dict:
         return {
@@ -947,20 +969,14 @@ class SearchEngine:
 
     @property
     def resume_count(self) -> int:
-        return len(self.metadata)
+        return len(self.resume_metadata)
 
     def get_unique_majors(self) -> list[str]:
         if self.members_df is not None:
             return sorted(self.members_df["Major"].dropna().unique().tolist())
-        return sorted({m.get("major", "") for m in self.metadata if m.get("major")})
+        return sorted({m.get("major", "") for m in self.resume_metadata if m.get("major")})
 
     def get_unique_grad_years(self) -> list[str]:
         if self.members_df is not None:
-            return sorted(
-                self.members_df["Graduation Year"]
-                .dropna()
-                .astype(str)
-                .unique()
-                .tolist()
-            )
-        return sorted({str(m.get("graduation_year", "")) for m in self.metadata if m.get("graduation_year")})
+            return sorted(self.members_df["Graduation Year"].dropna().astype(str).unique().tolist())
+        return sorted({str(m.get("graduation_year", "")) for m in self.resume_metadata if m.get("graduation_year")})
