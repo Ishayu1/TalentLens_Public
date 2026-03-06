@@ -313,6 +313,79 @@ def render_results(results: list[ResumeResult]):
             _render_detail_panel(r)
 
 
+def _render_metric_section(
+    title: str,
+    label_to_key_weight: dict[str, tuple[str, int]],
+    breakdown: dict,
+) -> None:
+    """Render a subsection of scores (e.g. job match or resume quality) with weights."""
+    if not breakdown:
+        return
+    st.markdown(f"**{title}**")
+    # Scores from Grok are 0-10
+    for label, (key, weight_pct) in label_to_key_weight.items():
+        raw = breakdown.get(key)
+        try:
+            val = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            val = None
+        if val is not None:
+            score_10 = max(0.0, min(10.0, val))
+            bar_color = COLORS["score_green"] if score_10 >= 7 else (COLORS["score_yellow"] if score_10 >= 4 else COLORS["score_red"])
+            st.markdown(
+                f'<div style="margin-bottom:0.35rem; font-size:0.9rem;">'
+                f'<span style="opacity:0.9;">{label}</span> '
+                f'<span style="color:{bar_color}; font-weight:600;">{score_10:.1f}/10</span> '
+                f'<span style="opacity:0.6; font-size:0.8rem;">(weight {weight_pct}%)</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    st.markdown("")  # spacing
+
+
+def _render_ranking_formula(details: dict) -> None:
+    if not details:
+        return
+
+    st.markdown("#### Ranking Formula")
+    formula_cols = st.columns(4)
+    formula_cols[0].metric("Base Search", f"{float(details.get('base_search_score', 0.0)):.2f}/10")
+
+    if details.get("job_match_score") is not None:
+        formula_cols[1].metric("Job Match", f"{float(details.get('job_match_score', 0.0)):.2f}/10")
+    else:
+        formula_cols[1].metric("Job Match", "N/A")
+
+    if details.get("resume_quality_score") is not None:
+        formula_cols[2].metric("Resume Quality", f"{float(details.get('resume_quality_score', 0.0)):.2f}/10")
+    else:
+        formula_cols[2].metric("Resume Quality", "N/A")
+
+    if details.get("penalty_applied") is not None:
+        formula_cols[3].metric("Penalty", f"-{float(details.get('penalty_applied', 0.0)):.2f}/10")
+    else:
+        formula_cols[3].metric("Penalty", "0.00/10")
+
+    mode = details.get("mode", "")
+    if mode:
+        st.caption(f"Ranking mode: `{mode}`")
+
+    matched_skill_count = details.get("matched_skill_count")
+    matched_skill_ratio = details.get("matched_skill_ratio")
+    if matched_skill_count is not None:
+        ratio_text = ""
+        if matched_skill_ratio is not None:
+            ratio_text = f" ({float(matched_skill_ratio) * 100:.0f}% of query skills)"
+        st.markdown(f"**Matched skills used in ranking:** {int(matched_skill_count)}{ratio_text}")
+
+    hard_fail_count = details.get("hard_fail_count")
+    revision_flag_count = details.get("revision_flag_count")
+    if hard_fail_count is not None or revision_flag_count is not None:
+        st.markdown(
+            f"**Penalty drivers:** {int(hard_fail_count or 0)} hard-fail flags, "
+            f"{int(revision_flag_count or 0)} revision flags"
+        )
+
 def _render_detail_panel(r: ResumeResult):
     col1, col2 = st.columns(2)
     with col1:
@@ -362,12 +435,44 @@ def _render_detail_panel(r: ResumeResult):
             unsafe_allow_html=True,
         )
 
-    if r.recruiter_score or r.resume_quality_score:
+    ranking_details = getattr(r, "ranking_details", {}) or {}
+    if ranking_details or r.recruiter_score or r.resume_quality_score or r.semantic_score:
         st.markdown("### Score Breakdown")
-        score_cols = st.columns(3)
+        score_cols = st.columns(4)
         score_cols[0].metric("Combined Score", f"{r.score:.3f}")
-        score_cols[1].metric("Job Match", f"{r.recruiter_score:.1f}/10")
-        score_cols[2].metric("Resume Quality", f"{r.resume_quality_score:.1f}/10")
+        score_cols[1].metric("Base Search", f"{r.semantic_score:.3f}")
+        score_cols[2].metric("Job Match", f"{r.recruiter_score:.1f}/10")
+        score_cols[3].metric("Resume Quality", f"{r.resume_quality_score:.1f}/10")
+
+        _render_ranking_formula(ranking_details)
+
+        # Section-based metrics that explain why the resume is ranked this way
+        recruiter_breakdown = getattr(r, "recruiter_breakdown", {}) or {}
+        quality_breakdown = getattr(r, "resume_quality_breakdown", {}) or {}
+        if recruiter_breakdown or quality_breakdown:
+            st.markdown("#### Why this rank — metrics by section")
+            _render_metric_section(
+                "Job match (vs job description)",
+                {
+                    "Impact": ("impact_score", 35),
+                    "Technology fit": ("technology_fit_score", 35),
+                    "Keyword alignment": ("keyword_alignment_score", 20),
+                    "Role fit": ("role_fit_score", 10),
+                },
+                recruiter_breakdown,
+            )
+            _render_metric_section(
+                "Resume quality (ATS & content)",
+                {
+                    "ATS format": ("ats_format_score", 18),
+                    "Section quality": ("section_quality_score", 12),
+                    "Bullet quality": ("bullet_quality_score", 20),
+                    "Technical relevance": ("technical_relevance_score", 22),
+                    "Truthfulness": ("truthfulness_score", 18),
+                    "Project strength": ("project_strength_score", 10),
+                },
+                quality_breakdown,
+            )
 
     if r.hard_fail_flags:
         st.error("Hard-fail risks: " + ", ".join(r.hard_fail_flags))

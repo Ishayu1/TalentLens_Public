@@ -7,9 +7,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# xAI docs use "grok-4-1-fast-reasoning"; try hyphenated form first
 GROK_MODEL_CANDIDATES = [
-    "grok-4.1-fast-reasoning",
     "grok-4-1-fast-reasoning",
+    "grok-4.1-fast-reasoning",
 ]
 
 DEFAULT_RECRUITER_ASSESSMENT = {
@@ -60,6 +61,7 @@ def _report_error(message: str):
 
 
 def _create_chat_completion(client, messages: list[dict], temperature: float):
+    # xAI docs: only model, messages, stream (no temperature in official examples)
     last_error = None
     for model_name in GROK_MODEL_CANDIDATES:
         try:
@@ -72,12 +74,21 @@ def _create_chat_completion(client, messages: list[dict], temperature: float):
                 json={
                     "model": model_name,
                     "messages": messages,
-                    "temperature": temperature,
+                    "stream": False,
                 },
-                timeout=60,
+                timeout=120,
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.HTTPError as exc:
+            last_error = exc
+            err_body = ""
+            try:
+                err_body = (exc.response.text or "")[:500]
+            except Exception:
+                pass
+            if "Model not found" not in str(exc) and "model" not in err_body.lower():
+                raise
         except Exception as exc:
             last_error = exc
             if "Model not found" not in str(exc):

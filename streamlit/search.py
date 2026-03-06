@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 import os
@@ -109,6 +111,7 @@ class ResumeResult:
     resume_quality_breakdown: dict = field(default_factory=dict)
     resume_flags: list[str] = field(default_factory=list)
     hard_fail_flags: list[str] = field(default_factory=list)
+    ranking_details: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,8 @@ class SearchEngine:
         self.fallback_avg_doc_length: float = 0.0
         self.metadata: list[dict] = []
         self.members_df: Optional[pd.DataFrame] = None
+        # Pre-built lookup: lowercased full_name → member meta dict (O(1) lookups)
+        self._member_index: dict[str, dict] = {}
         self.demo_mode = False
         self.mode_label = "Live"
         self.mode_banner = ""
@@ -187,21 +192,57 @@ class SearchEngine:
 
         if not FAISS_INDEX_PATH.exists():
             raise FileNotFoundError(f"FAISS index not found at {FAISS_INDEX_PATH}")
-        if not METADATA_PATH.exists():
-            raise FileNotFoundError(f"Metadata not found at {METADATA_PATH}")
 
         self.model = SentenceTransformer(MODEL_NAME)
         self.index = faiss.read_index(str(FAISS_INDEX_PATH))
-
-        with open(METADATA_PATH, "r") as f:
-            self.metadata = json.load(f)
+        self.metadata = self._load_or_build_member_metadata()
 
         if MEMBERS_CSV.exists():
             self.members_df = pd.read_csv(MEMBERS_CSV)
+            self._build_member_index()
 
         self.demo_mode = False
         self.mode_label = "Live"
         self.mode_banner = ""
+
+    def _load_or_build_member_metadata(self) -> list[dict]:
+        if METADATA_PATH.exists():
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        if not FALLBACK_RESUME_PATH.exists():
+            raise FileNotFoundError(
+                f"Metadata not found at {METADATA_PATH} and fallback resume data not found at {FALLBACK_RESUME_PATH}"
+            )
+
+        with open(FALLBACK_RESUME_PATH, "r", encoding="utf-8") as f:
+            raw_resumes = json.load(f)
+
+        rebuilt_metadata = []
+        for item in raw_resumes:
+            if item.get("source") != "ds3_members":
+                continue
+
+            member_meta = item.get("metadata", {})
+            rebuilt_metadata.append(
+                {
+                    "filename": item.get("filename", ""),
+                    "file_path": item.get("file_path", ""),
+                    "text": item.get("text", ""),
+                    "source": item.get("source", "ds3_members"),
+                    "full_name": member_meta.get("full_name", ""),
+                    "major": member_meta.get("major", ""),
+                    "graduation_year": str(member_meta.get("graduation_year", "")),
+                    "resume_link": member_meta.get("resume_link", ""),
+                    "linkedin": member_meta.get("linkedin", ""),
+                    "github": member_meta.get("github", ""),
+                }
+            )
+
+        if not rebuilt_metadata:
+            raise ValueError("Could not rebuild member metadata from fallback resume data.")
+
+        return rebuilt_metadata
 
     def _load_ds3_fallback(self):
         if not FALLBACK_RESUME_PATH.exists():
@@ -212,6 +253,7 @@ class SearchEngine:
 
         if MEMBERS_CSV.exists():
             self.members_df = pd.read_csv(MEMBERS_CSV)
+            self._build_member_index()
 
         try:
             from sentence_transformers import SentenceTransformer
@@ -465,6 +507,12 @@ class SearchEngine:
                     linkedin=member_info.get("linkedin", ""),
                     github=member_info.get("github", ""),
                     matched_skills=matched,
+                    ranking_details={
+                        "mode": "semantic_search",
+                        "base_search_score": float(score),
+                        "matched_skill_count": len(matched),
+                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
+                    },
                 )
             )
 
@@ -559,6 +607,12 @@ class SearchEngine:
                     linkedin=member_info.get("linkedin", meta.get("linkedin", "")),
                     github=member_info.get("github", meta.get("github", "")),
                     matched_skills=matched,
+                    ranking_details={
+                        "mode": "fallback_search",
+                        "base_search_score": float(score),
+                        "matched_skill_count": len(matched),
+                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
+                    },
                 )
             )
 
@@ -638,6 +692,12 @@ class SearchEngine:
                     linkedin="",
                     github="",
                     matched_skills=matched,
+                    ranking_details={
+                        "mode": "demo_search",
+                        "base_search_score": float(score),
+                        "matched_skill_count": len(matched),
+                        "matched_skill_ratio": (len(matched) / len(query_skills)) if query_skills else 0.0,
+                    },
                 )
             )
         return results
@@ -652,88 +712,120 @@ class SearchEngine:
         if rerank_count == 0:
             return results
 
-        for result in results[:rerank_count]:
-            recruiter_assessment = assess_candidate_with_grok(
+        def _assess_one(result: ResumeResult) -> tuple[ResumeResult, dict, dict]:
+            candidate_text = result.full_text or result.text_preview
+            candidate_name = result.full_name or result.filename
+            recruiter = assess_candidate_with_grok(
                 job_description=job_description,
-                candidate_text=result.full_text or result.text_preview,
-                candidate_name=result.full_name or result.filename,
+                candidate_text=candidate_text,
+                candidate_name=candidate_name,
                 api_key=api_key,
             )
-            rubric_assessment = assess_resume_quality_with_grok(
+            rubric = assess_resume_quality_with_grok(
                 job_description=job_description,
-                candidate_text=result.full_text or result.text_preview,
-                candidate_name=result.full_name or result.filename,
+                candidate_text=candidate_text,
+                candidate_name=candidate_name,
                 api_key=api_key,
             )
+            return result, recruiter, rubric
 
-            recruiter_signal = (
-                (recruiter_assessment.get("impact_score", 0.0) * 0.35)
-                + (recruiter_assessment.get("technology_fit_score", 0.0) * 0.35)
-                + (recruiter_assessment.get("keyword_alignment_score", 0.0) * 0.20)
-                + (recruiter_assessment.get("role_fit_score", 0.0) * 0.10)
-            ) / 10.0
-            quality_signal = (
-                (rubric_assessment.get("ats_format_score", 0.0) * 0.18)
-                + (rubric_assessment.get("section_quality_score", 0.0) * 0.12)
-                + (rubric_assessment.get("bullet_quality_score", 0.0) * 0.20)
-                + (rubric_assessment.get("technical_relevance_score", 0.0) * 0.22)
-                + (rubric_assessment.get("truthfulness_score", 0.0) * 0.18)
-                + (rubric_assessment.get("project_strength_score", 0.0) * 0.10)
-            ) / 10.0
-            base_signal = min(result.score / RECRUITER_MAX_SCORE, 1.0)
-            hard_fail_flags = rubric_assessment.get("hard_fail_flags", [])
-            revision_flags = rubric_assessment.get("revision_flags", [])
-            penalty = min(
-                0.45,
-                (0.12 * len(hard_fail_flags)) + (0.04 * len(revision_flags)),
-            )
-            blended_signal = max(
-                0.0,
-                (
-                    (RECRUITER_RERANK_BASE_WEIGHT * base_signal)
-                    + (RECRUITER_RERANK_MATCH_WEIGHT * recruiter_signal)
-                    + (RECRUITER_RERANK_QUALITY_WEIGHT * quality_signal)
-                    - penalty
-                ),
-            )
+        # Fire all candidate assessments concurrently — collapses
+        # (rerank_count × 2 × latency) sequential calls down to ~(2 × latency).
+        with ThreadPoolExecutor(max_workers=rerank_count) as executor:
+            futures = {
+                executor.submit(_assess_one, r): r
+                for r in results[:rerank_count]
+            }
+            for future in as_completed(futures):
+                result, recruiter_assessment, rubric_assessment = future.result()
 
-            result.recruiter_score = round(recruiter_signal * 10.0, 2)
-            result.recruiter_breakdown = recruiter_assessment
-            result.resume_quality_score = round(quality_signal * 10.0, 2)
-            result.resume_quality_breakdown = rubric_assessment
-            result.resume_flags = revision_flags
-            result.hard_fail_flags = hard_fail_flags
-            result.score = round(
-                min(blended_signal * RECRUITER_MAX_SCORE, RECRUITER_MAX_SCORE),
-                4,
-            )
+                recruiter_signal = (
+                    (recruiter_assessment.get("impact_score", 0.0) * 0.35)
+                    + (recruiter_assessment.get("technology_fit_score", 0.0) * 0.35)
+                    + (recruiter_assessment.get("keyword_alignment_score", 0.0) * 0.20)
+                    + (recruiter_assessment.get("role_fit_score", 0.0) * 0.10)
+                ) / 10.0
+                quality_signal = (
+                    (rubric_assessment.get("ats_format_score", 0.0) * 0.18)
+                    + (rubric_assessment.get("section_quality_score", 0.0) * 0.12)
+                    + (rubric_assessment.get("bullet_quality_score", 0.0) * 0.20)
+                    + (rubric_assessment.get("technical_relevance_score", 0.0) * 0.22)
+                    + (rubric_assessment.get("truthfulness_score", 0.0) * 0.18)
+                    + (rubric_assessment.get("project_strength_score", 0.0) * 0.10)
+                ) / 10.0
+                base_signal = min(result.score / RECRUITER_MAX_SCORE, 1.0)
+                hard_fail_flags = rubric_assessment.get("hard_fail_flags", [])
+                revision_flags = rubric_assessment.get("revision_flags", [])
+                penalty = min(
+                    0.45,
+                    (0.12 * len(hard_fail_flags)) + (0.04 * len(revision_flags)),
+                )
+                blended_signal = max(
+                    0.0,
+                    (
+                        (RECRUITER_RERANK_BASE_WEIGHT * base_signal)
+                        + (RECRUITER_RERANK_MATCH_WEIGHT * recruiter_signal)
+                        + (RECRUITER_RERANK_QUALITY_WEIGHT * quality_signal)
+                        - penalty
+                    ),
+                )
+
+                result.recruiter_score = round(recruiter_signal * 10.0, 2)
+                result.recruiter_breakdown = recruiter_assessment
+                result.resume_quality_score = round(quality_signal * 10.0, 2)
+                result.resume_quality_breakdown = rubric_assessment
+                result.resume_flags = revision_flags
+                result.hard_fail_flags = hard_fail_flags
+                result.ranking_details = {
+                    "mode": "recruiter_reranked",
+                    "base_search_score": round(base_signal * 10.0, 2),
+                    "job_match_score": round(recruiter_signal * 10.0, 2),
+                    "resume_quality_score": round(quality_signal * 10.0, 2),
+                    "penalty_applied": round(penalty * 10.0, 2),
+                    "final_blended_score": round(blended_signal * 10.0, 2),
+                    "hard_fail_count": len(hard_fail_flags),
+                    "revision_flag_count": len(revision_flags),
+                }
+                result.score = round(
+                    min(blended_signal * RECRUITER_MAX_SCORE, RECRUITER_MAX_SCORE),
+                    4,
+                )
 
         results.sort(key=lambda item: item.score, reverse=True)
         return results
 
     # ----- helpers ----------------------------------------------------------
-    def _lookup_member(self, filename: str, text: str = "") -> dict:
-        """Try to match a resume filename or content to a row in members.csv."""
+    def _build_member_index(self) -> None:
+        """Build a name→meta dict from members_df for O(1) lookups at search time."""
+        self._member_index = {}
         if self.members_df is None:
+            return
+        for _, row in self.members_df.iterrows():
+            name = str(row.get("Full Name", "")).strip().lower()
+            if name:
+                self._member_index[name] = self._row_to_meta(row)
+
+    def _lookup_member(self, filename: str, text: str = "") -> dict:
+        """Match a resume filename or text header to a member row using the pre-built index."""
+        if not self._member_index:
             return {}
-        
+
         # 1. Try filename stem match
         name_stem = Path(filename).stem.replace("_", " ").replace("-", " ").lower()
-        for _, row in self.members_df.iterrows():
-            full_name = str(row.get("Full Name", "")).lower()
-            if full_name and full_name in name_stem:
-                return self._row_to_meta(row)
-        
-        # 2. Try matching name within the first part of the text (heuristic for resumes)
+        for name, meta in self._member_index.items():
+            if name in name_stem:
+                return meta
+
+        # 2. Try matching name within the first 500 chars of the resume text
         if text:
             text_head = text[:500].lower()
-            for _, row in self.members_df.iterrows():
-                full_name = str(row.get("Full Name", "")).lower()
-                if full_name and full_name in text_head:
-                    return self._row_to_meta(row)
-                    
+            for name, meta in self._member_index.items():
+                if name in text_head:
+                    return meta
+
         return {}
 
+    @lru_cache(maxsize=512)
     def _resolve_resume_path(self, filename: str, file_path: str = "") -> str:
         candidates: list[Path] = []
         if file_path:
