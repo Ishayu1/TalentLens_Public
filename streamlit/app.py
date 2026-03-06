@@ -30,6 +30,7 @@ from components import (
     render_skills_panel,
 )
 from search import SearchEngine
+from grok_utils import get_explanation_with_grok
 from styles import get_css
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,19 @@ if search_clicked:
                 skill_filters=None,
                 grad_year_filter=grad_year_filter,
                 major_filter=major_filter,
+                input_mode="Job Description"
             )
+        
+        # --- Generate Grok Explanations for Top 3 ---
+        if results:
+            with st.spinner("Generating Grok AI match analysis..."):
+                for res in results[:3]:
+                    res.explanation = get_explanation_with_grok(
+                        job_description=query,
+                        candidate_text=res.text_preview,
+                        candidate_name=res.full_name
+                    )
+        
         st.session_state["last_results"] = results
 
 # ---------------------------------------------------------------------------

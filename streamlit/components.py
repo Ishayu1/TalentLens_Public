@@ -304,7 +304,10 @@ def render_results(results: list[ResumeResult]):
                 <div class="result-name">{display_name}</div>
                 {major_line}
             </div>
-            <div class="result-score" style="color:{score_col};">{score_pct}</div>
+            <div style="text-align:right;">
+                <div class="result-score" style="color:{score_col};">{score_pct}</div>
+                <div style="font-size:0.7rem; opacity:0.6;">Score: {r.score:.3f}</div>
+            </div>
         </div>
         """
         st.markdown(card_html, unsafe_allow_html=True)
@@ -335,6 +338,22 @@ def _render_detail_panel(r: ResumeResult):
         skills_html = "".join(f'<span class="matched-skill">{s}</span>' for s in r.matched_skills)
         st.markdown(
             f'<div style="margin-top:0.6rem;"><span class="detail-label">Matched Skills:</span><br/>{skills_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    explanation = getattr(r, "explanation", "")
+    if explanation:
+        st.markdown(
+            f"""
+            <div style="margin-top:1rem; padding:0.8rem; background:rgba(121, 40, 202, 0.1); border-left:3px solid #7928ca; border-radius:4px;">
+                <div style="font-size:0.8rem; font-weight:600; color:#7928ca; margin-bottom:0.3rem;">
+                    ✨ Grok AI Match Analysis
+                </div>
+                <div style="font-size:0.9rem; font-style:italic; line-height:1.4;">
+                    "{r.explanation}"
+                </div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 

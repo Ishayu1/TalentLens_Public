@@ -14,6 +14,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+import os
+try:
+    from grok_utils import extract_skills_with_grok
+except ImportError:
+    from streamlit.grok_utils import extract_skills_with_grok
 
 import numpy as np
 import pandas as pd
@@ -49,6 +54,7 @@ class ResumeResult:
     linkedin: str = ""
     github: str = ""
     matched_skills: list = field(default_factory=list)
+    explanation: str = "" # Grok AI explanation
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +182,6 @@ class SearchEngine:
                 }
             )
 
-    # ----- search -----------------------------------------------------------
     def search(
         self,
         query: str,
@@ -185,13 +190,15 @@ class SearchEngine:
         skill_filters: list[str] | None = None,
         grad_year_filter: str | None = None,
         major_filter: str | None = None,
+        input_mode: str = "Skills",
+        api_key: str | None = None,
     ) -> list[ResumeResult]:
         if self.demo_mode:
             return self._search_demo(
                 query, top_k, skill_filters, grad_year_filter, major_filter
             )
         return self._search_production(
-            query, top_k, min_score, skill_filters, grad_year_filter, major_filter
+            query, top_k, min_score, skill_filters, grad_year_filter, major_filter, input_mode, api_key
         )
 
     def _search_production(
@@ -202,18 +209,35 @@ class SearchEngine:
         skill_filters: list[str] | None,
         grad_year_filter: str | None,
         major_filter: str | None,
+        input_mode: str = "Skills",
+        api_key: str | None = None,
     ) -> list[ResumeResult]:
         import faiss as _faiss
+
+        # --- Backend Grok Skill Extraction ---
+        if input_mode == "Job Description":
+            extracted_skills = extract_skills_with_grok(query, api_key=api_key)
+            if extracted_skills:
+                # Merge with any existing filters
+                if skill_filters:
+                    skill_filters = list(set(skill_filters + extracted_skills))
+                else:
+                    skill_filters = extracted_skills
 
         query_embedding = self.model.encode([query]).astype("float32")
         _faiss.normalize_L2(query_embedding)
 
-        fetch_k = min(top_k * 3, len(self.metadata))
+        # Increase fetch window to allow boosted resumes to climb from further down
+        fetch_k = max(100, min(top_k * 10, len(self.metadata)))
         scores, indices = self.index.search(query_embedding, fetch_k)
 
         query_skills = [s.strip() for s in query.split(",") if s.strip()]
         if skill_filters:
             query_skills = list(set(query_skills + skill_filters))
+
+        # Check for prominent companies in the query/JD to apply extra emphasis
+        target_companies = ["amazon", "google", "meta", "microsoft", "apple", "netflix"]
+        jd_companies = [c for c in target_companies if c in query.lower()]
 
         results: list[ResumeResult] = []
         for idx, score in zip(indices[0], scores[0]):
@@ -223,7 +247,38 @@ class SearchEngine:
             text = meta.get("text", "")
             matched = extract_matched_skills(text, query_skills) if query_skills else []
 
-            member_info = self._lookup_member(meta.get("filename", ""))
+            # --- Score Boosting ---
+            final_score = float(score)
+            if query_skills and matched:
+                match_ratio = len(matched) / len(query_skills)
+                final_score += (0.2 * match_ratio)
+                
+                # HUGE boost for target company match if it's the subject of the search
+                for company in jd_companies:
+                    # Check for variations like AWS for Amazon
+                    is_match = company in text.lower() or (company == "amazon" and "aws" in text.lower())
+                    
+                    if is_match:
+                        # massive boost to prioritize past experience at the same company
+                        final_score += 0.3
+                        # Extra boost for specific career-starting roles (Intern/SDE/Internship)
+                        # We use multiline regex with a slightly larger window
+                        role_pattern = rf"(intern|sde|engineer|researcher|analyst)[\s\S]{{0,100}}\b({company}|aws)\b"
+                        if re.search(role_pattern, text.lower(), re.I):
+                             final_score += 0.3
+                             # Specific higher priority for Interns/SDEs per user request
+                             if re.search(rf"(intern|sde)[\s\S]{{0,50}}\b({company}|aws)\b", text.lower(), re.I):
+                                 final_score += 0.2
+                        elif re.search(rf"\b({company}|aws)\b[\s\S]{{0,100}}\b(intern|sde|engineer|researcher|analyst)\b", text.lower(), re.I):
+                             final_score += 0.3
+                             # Specific higher priority for Interns/SDEs per user request
+                             if re.search(rf"\b({company}|aws)\b[\s\S]{{0,50}}\b(intern|sde)\b", text.lower(), re.I):
+                                 final_score += 0.2
+                
+                final_score = min(final_score, 1.8) # Allow ranking to go higher
+                         
+
+            member_info = self._lookup_member(meta.get("filename", ""), text)
 
             if grad_year_filter and member_info.get("graduation_year", "") != grad_year_filter:
                 continue
@@ -234,7 +289,7 @@ class SearchEngine:
                 ResumeResult(
                     rank=0,
                     filename=meta.get("filename", ""),
-                    score=float(score),
+                    score=final_score,
                     file_path=meta.get("file_path", ""),
                     text_preview=text[:400],
                     source=meta.get("source", "ds3_members"),
@@ -248,8 +303,9 @@ class SearchEngine:
                 )
             )
 
-            if len(results) >= top_k:
-                break
+        # Re-sort results based on the boosted score and take top_k
+        results.sort(key=lambda x: x.score, reverse=True)
+        results = results[:top_k]
 
         for i, r in enumerate(results, 1):
             r.rank = i
@@ -321,23 +377,37 @@ class SearchEngine:
         return results
 
     # ----- helpers ----------------------------------------------------------
-    def _lookup_member(self, filename: str) -> dict:
-        """Try to match a resume filename to a row in members.csv."""
+    def _lookup_member(self, filename: str, text: str = "") -> dict:
+        """Try to match a resume filename or content to a row in members.csv."""
         if self.members_df is None:
             return {}
+        
+        # 1. Try filename stem match
         name_stem = Path(filename).stem.replace("_", " ").replace("-", " ").lower()
         for _, row in self.members_df.iterrows():
             full_name = str(row.get("Full Name", "")).lower()
             if full_name and full_name in name_stem:
-                return {
-                    "full_name": row.get("Full Name", ""),
-                    "major": row.get("Major", ""),
-                    "graduation_year": str(row.get("Graduation Year", "")),
-                    "resume_link": row.get("Resume Link", ""),
-                    "linkedin": row.get("Linkedin Link", ""),
-                    "github": row.get("Github Link", ""),
-                }
+                return self._row_to_meta(row)
+        
+        # 2. Try matching name within the first part of the text (heuristic for resumes)
+        if text:
+            text_head = text[:500].lower()
+            for _, row in self.members_df.iterrows():
+                full_name = str(row.get("Full Name", "")).lower()
+                if full_name and full_name in text_head:
+                    return self._row_to_meta(row)
+                    
         return {}
+
+    def _row_to_meta(self, row) -> dict:
+        return {
+            "full_name": row.get("Full Name", ""),
+            "major": row.get("Major", ""),
+            "graduation_year": str(row.get("Graduation Year", "")),
+            "resume_link": row.get("Resume Link", ""),
+            "linkedin": row.get("Linkedin Link", ""),
+            "github": row.get("Github Link", ""),
+        }
 
     @property
     def resume_count(self) -> int:
