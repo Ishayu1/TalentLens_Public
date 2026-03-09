@@ -432,9 +432,10 @@ class SearchEngine:
         _faiss.normalize_L2(query_embedding)
         scores, indices = self.index.search(query_embedding, top_k)
 
+        n_meta = len(self.chunk_metadata)
         hits: list[ChunkHit] = []
         for idx, score in zip(indices[0], scores[0]):
-            if idx < 0:
+            if idx < 0 or idx >= n_meta:
                 continue
             row = self.chunk_metadata[idx]
             hits.append(
