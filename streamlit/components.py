@@ -154,33 +154,7 @@ def render_search_bar(selected_skills: list[str]) -> tuple[str, bool, bool]:
     return query, search_submitted, clear_clicked
 
 
-def render_job_description_summary(analysis: dict):
-    retrieval = analysis.get("retrieval", {})
-    st.markdown("<p class='section-heading'>Parsed Job Description</p>", unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"**Job title:** {analysis.get('job_title') or 'Unknown'}")
-        st.markdown(f"**Minimum years:** {analysis.get('minimum_years_experience') if analysis.get('minimum_years_experience') is not None else 'Not detected'}")
-        st.markdown(f"**Location:** {analysis.get('location') or 'Not detected'}")
-        st.markdown(f"**Remote policy:** {analysis.get('remote_policy') or 'Not detected'}")
-    with col2:
-        st.markdown(f"**Backend:** {retrieval.get('backend', 'unknown')}")
-        st.markdown(f"**Retrieved chunks:** {retrieval.get('retrieved_chunks', 0)}")
-        st.markdown(f"**Shortlisted candidates:** {retrieval.get('shortlisted_candidates', 0)}")
-        st.markdown(f"**Chunk fetch K:** {retrieval.get('top_k_chunks', 0)}")
 
-    must_have = analysis.get("must_have_skills", [])
-    preferred = analysis.get("preferred_skills", [])
-    degrees = analysis.get("degree_requirements", [])
-    if must_have:
-        st.markdown("**Must-have skills**")
-        st.markdown(" ".join(f"`{skill}`" for skill in must_have))
-    if preferred:
-        st.markdown("**Preferred skills**")
-        st.markdown(" ".join(f"`{skill}`" for skill in preferred))
-    if degrees:
-        st.markdown("**Degree requirements**")
-        st.markdown(", ".join(degrees))
 
 
 def _score_color(score: float) -> str:
@@ -227,7 +201,6 @@ def render_results(results: list[ResumeResult]):
                 </div>
                 <div style="text-align:right;">
                     <div class="result-score" style="color:{score_col};">{score_pct}</div>
-                    <div style="font-size:0.7rem; opacity:0.6;">Score: {r.score:.3f}</div>
                 </div>
             </div>
             """,
@@ -268,7 +241,11 @@ def _render_ranking_details(details: dict):
     cols[0].metric("Best evidence", f"{float(details.get('base_search_score', 0.0)):.3f}")
     cols[1].metric("Mean top chunks", f"{float(details.get('mean_top_chunk_score', 0.0)):.3f}")
     cols[2].metric("Evidence chunks", int(details.get("evidence_chunk_count", 0)))
-    cols[3].metric("Backend", details.get("retrieval_backend", "n/a"))
+    if "reranker_score" in details:
+        cols[3].metric("Reranker Score", f"{float(details.get('reranker_score', 0.0)):.3f}")
+    else:
+        cols[3].metric("Backend", details.get("retrieval_backend", "n/a"))
+    
     if details.get("total_must_have_count"):
         st.markdown(
             f"**Must-have matches:** {details.get('matched_must_have_count', 0)} / {details.get('total_must_have_count', 0)}"
@@ -301,11 +278,7 @@ def _render_detail_panel(r: ResumeResult):
         if r.graduation_year:
             st.markdown(f"<span class='detail-label'>Graduation:</span> <span class='detail-value'>{r.graduation_year}</span>", unsafe_allow_html=True)
     with col2:
-        if r.local_resume_path:
-            st.markdown(
-                f"<span class='detail-label'>Local Resume:</span> <span class='detail-value'>{Path(r.local_resume_path).name}</span>",
-                unsafe_allow_html=True,
-            )
+
         if r.resume_link:
             st.markdown(f"<span class='detail-label'>Resume:</span> <a href='{r.resume_link}' target='_blank' class='open-link'>Open PDF &rarr;</a>", unsafe_allow_html=True)
         if r.linkedin:
@@ -317,32 +290,9 @@ def _render_detail_panel(r: ResumeResult):
         skills_html = "".join(f'<span class="matched-skill">{s}</span>' for s in r.matched_skills)
         st.markdown(f'<div style="margin-top:0.6rem;"><span class="detail-label">Matched Skills:</span><br/>{skills_html}</div>', unsafe_allow_html=True)
 
-    _render_filter_status(getattr(r, "hard_filter_status", {}) or {})
-    _render_ranking_details(getattr(r, "ranking_details", {}) or {})
-    _render_evidence_chunks(getattr(r, "top_evidence_chunks", []) or [])
 
-    if r.local_resume_path:
-        pdf_path = Path(r.local_resume_path)
-        if pdf_path.exists():
-            pdf_bytes = pdf_path.read_bytes()
-            pdf_b64 = base64.b64encode(pdf_bytes).decode()
-            st.markdown(
-                f"""
-                <div style="margin-top:0.8rem; margin-bottom:0.5rem; font-size:0.85rem; opacity:0.8;">
-                    Resume Preview
-                </div>
-                <iframe
-                    src="data:application/pdf;base64,{pdf_b64}"
-                    width="100%"
-                    height="900"
-                    style="border:1px solid rgba(255,255,255,0.1); border-radius:8px; background:white;"
-                ></iframe>
-                """,
-                unsafe_allow_html=True,
-            )
 
-    if r.text_preview:
-        st.markdown(f'<div class="text-preview">{r.text_preview}</div>', unsafe_allow_html=True)
+
 
 
 def render_initial_state():

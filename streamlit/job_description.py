@@ -54,6 +54,7 @@ SKILL_ALIASES: dict[str, tuple[str, ...]] = {
     "Rust": ("rust",),
     "Go": (" golang ", " go ", "golang"),
     "Scala": ("scala",),
+    "Amazon": ("amazon", "amazon.inc"),
 }
 
 for skill in SKILL_SUGGESTIONS:
@@ -82,6 +83,7 @@ LOCATION_PREFIX_RE = re.compile(r"^(location|based in|office location)\s*[:\-]\s
 class ParsedJobDescription:
     raw_text: str
     job_title: str = ""
+    company: str = ""
     must_have_skills: list[str] = field(default_factory=list)
     preferred_skills: list[str] = field(default_factory=list)
     minimum_years_experience: int | None = None
@@ -108,6 +110,32 @@ def _extract_title(lines: list[str]) -> str:
         if len(line.split()) <= 10 and not re.match(r"^[\-\*\d]", line):
             if not REQUIRED_SECTION_RE.search(line) and not PREFERRED_SECTION_RE.search(line):
                 return line
+    return ""
+    
+def _extract_company(lines: list[str]) -> str:
+    # Look for common company markers or known big tech
+    for line in lines[:10]:
+        val = ""
+        # Handle "|" separators
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            for p in parts:
+                if any(x in p.lower() for x in ["amazon", "google", "meta", "apple", "microsoft", "netflix", "nvidia"]):
+                    val = p
+                    break
+        else:
+            # Match "Company: X"
+            match = re.search(r"\b(?:company|employer|firm)\s*[:\-]\s*([A-Z][A-Za-z0-9\.\s]+)", line, re.I)
+            if match:
+                 val = match.group(1).strip()
+        
+        if val:
+            # Clean it up: "Amazon.com Services LLC" -> "Amazon"
+            core = val.split(".")[0].split()[0].strip().rstrip(",").rstrip(".")
+            # Keep meaningful second words for some
+            if core.lower() in ["hey", "the", "a"] and len(val.split()) > 1:
+                return " ".join(val.split()[:2])
+            return core
     return ""
 
 
@@ -204,6 +232,7 @@ def parse_job_description(text: str) -> ParsedJobDescription:
     return ParsedJobDescription(
         raw_text=text,
         job_title=_extract_title(lines),
+        company=_extract_company(lines),
         must_have_skills=must_have_skills,
         preferred_skills=preferred_skills,
         minimum_years_experience=minimum_years,

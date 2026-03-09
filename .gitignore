@@ -34,5 +34,6 @@ env/
 __pycache__/
 .idea/
 .vscode/
-*.ipynb_checkpoints/
+
+plan.md
 

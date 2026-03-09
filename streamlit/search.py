@@ -27,6 +27,8 @@ try:
         MODEL_NAME,
         PROJECT_ROOT,
         SKILL_SUGGESTIONS,
+        RERANKER_ENABLED,
+        RERANKER_MODEL_PATH,
     )
     from job_description import ParsedJobDescription, parse_job_description
 except ImportError:
@@ -42,6 +44,8 @@ except ImportError:
         MODEL_NAME,
         PROJECT_ROOT,
         SKILL_SUGGESTIONS,
+        RERANKER_ENABLED,
+        RERANKER_MODEL_PATH,
     )
     from streamlit.job_description import ParsedJobDescription, parse_job_description
 
@@ -99,6 +103,7 @@ class ResumeResult:
     ranking_details: dict = field(default_factory=dict)
     top_evidence_chunks: list[dict] = field(default_factory=list)
     hard_filter_status: dict = field(default_factory=dict)
+    reranker_score: float = 0.0
 
 
 @dataclass
@@ -163,6 +168,8 @@ class SearchEngine:
         self.mode_label = "Live"
         self.mode_banner = ""
         self.retrieval_backend = "uninitialized"
+        self.reranker = None
+        self.reranker_loaded = False
         self._load()
 
     def _load(self):
@@ -175,6 +182,7 @@ class SearchEngine:
         self._load_resume_metadata()
         self._prepare_resume_text_index()
         self._load_semantic_backend()
+        self._load_reranker()
 
         if self.chunk_metadata:
             chunk_msg = f"Chunk retrieval ready ({self.retrieval_backend})."
@@ -264,10 +272,35 @@ class SearchEngine:
         self.model = model
         self.index = index
         if metadata_kind == "chunk":
-            self.chunk_metadata = [row for row in metadata_rows if row.get("source") == "ds3_members"]
+            self.chunk_metadata = metadata_rows
             self.retrieval_backend = "semantic-chunk"
         else:
             self.retrieval_backend = "semantic-resume"
+
+    def _load_reranker(self):
+        """Lazily load the cross-encoder reranker if enabled and available."""
+        if self.reranker_loaded:
+            return
+        if not RERANKER_ENABLED:
+            self.reranker = None
+            self.reranker_loaded = False
+            return
+        if not RERANKER_MODEL_PATH.exists():
+            self.reranker = None
+            self.reranker_loaded = False
+            return
+        try:
+            from sentence_transformers import CrossEncoder
+
+            self.reranker = CrossEncoder(
+                str(RERANKER_MODEL_PATH),
+                max_length=512,
+                activation_fn=None,
+            )
+            self.reranker_loaded = True
+        except Exception:
+            self.reranker = None
+            self.reranker_loaded = False
 
     def _load_demo(self):
         self.demo_mode = True
@@ -329,7 +362,8 @@ class SearchEngine:
         major_filter: str | None,
     ) -> list[ResumeResult]:
         parsed = parse_job_description(query)
-        chunk_fetch_k = max(50, min(100, top_k * 5))
+        # Increase K for better recall across more candidates
+        chunk_fetch_k = max(top_k * 10, 250)
         chunk_hits = self._retrieve_chunks(query, parsed, top_k=chunk_fetch_k)
         results = self._aggregate_chunk_hits(
             chunk_hits=chunk_hits,
@@ -346,9 +380,14 @@ class SearchEngine:
                 "top_k_chunks": chunk_fetch_k,
                 "retrieved_chunks": len(chunk_hits),
                 "shortlisted_candidates": len(results),
+                "reranker_active": self.reranker_loaded,
             },
         }
-        return results
+        # Reranking
+        if self.reranker_loaded:
+            results = self._rerank(query, results, parsed)
+        
+        return results[:top_k]
 
     def _search_skills(
         self,
@@ -414,9 +453,100 @@ class SearchEngine:
             )
 
         scored_rows.sort(key=lambda item: item.score, reverse=True)
-        for i, result in enumerate(scored_rows[:top_k], 1):
+        top_results = scored_rows[:top_k]
+
+        if self.reranker_loaded and self.reranker is not None and top_results:
+            top_results = self._rerank(query, top_results)
+
+        for i, result in enumerate(top_results, 1):
             result.rank = i
-        return scored_rows[:top_k]
+        return top_results
+
+    def _rerank(self, query: str, results: list[ResumeResult], parsed: ParsedJobDescription | None = None) -> list[ResumeResult]:
+        """Second-stage reranking with a fine-tuned CrossEncoder."""
+        if not self.reranker_loaded or self.reranker is None or not results:
+            return results
+ 
+        pairs: list[tuple[str, str]] = []
+        # Synthesize a cleaner query: Company + Title + Must Haves
+        must_haves = []
+        parsed_company = ""
+        
+        if parsed:
+            must_haves = parsed.must_have_skills
+            parsed_company = parsed.company
+        else:
+            # Fallback if parsed not provided
+            must_haves = (getattr(results[0], "hard_filter_status", {}) or {}).get("matched_must_have_skills", []) or []
+            parsed_company = (getattr(self, "last_query_analysis", {}) or {}).get("company", "")
+
+        prefix = f"{parsed_company} " if parsed_company else ""
+        clean_query = f"{prefix}{query.splitlines()[0]} | {', '.join(must_haves)}"
+        
+        for r in results:
+            evidence_text = ""
+            if r.top_evidence_chunks:
+                # Join top 5 chunks for even more context
+                evidence_text = "\n".join(str(h.get("text", "")).strip() for h in r.top_evidence_chunks[:5])
+            if not evidence_text:
+                evidence_text = r.full_text or r.text_preview or ""
+            pairs.append((clean_query, evidence_text[:2000]))
+ 
+        try:
+            raw_scores = self.reranker.predict(pairs)
+            import numpy as np
+            # apply sigmoid to normalize scores close to [0,1]
+            scores = 1.0 / (1.0 + np.exp(-np.array(raw_scores)))
+        except Exception:
+            return results
+ 
+        w1 = 0.50 # retrieval + company boost
+        w2 = 0.20 # reranker
+        w3 = 0.20
+        w4 = 0.10
+ 
+        for r, s in zip(results, scores):
+            rerank_score = float(s)
+            r.reranker_score = rerank_score
+            r.ranking_details["reranker_score"] = round(rerank_score, 4)
+            r.ranking_details["reranker_model"] = "talentlens-cross-encoder-sft-v1"
+ 
+            # Use the already boosted/weighted score from aggregation as retrieval base
+            # This ensures company boost and must-have ratios are preserved
+            retrieval = float(r.score)
+            coverage = 0.0
+            constraints = 0.0
+ 
+            hard_filters = getattr(r, "hard_filter_status", {}) or {}
+            # Simplified coverage: use what we already have in ranking_details if available
+            if r.ranking_details:
+                total_must = r.ranking_details.get("total_must_have_skills", 0)
+                matched_must = r.ranking_details.get("matched_must_have_count", 0)
+                if total_must > 0:
+                    coverage = matched_must / total_must
+            
+            if hard_filters:
+                if hard_filters.get("passed") is True:
+                    constraints = 0.05
+                elif hard_filters.get("must_have_status") == "failed" or hard_filters.get("degree_status") == "failed" or hard_filters.get("years_experience_status") == "failed":
+                    constraints = -0.10
+ 
+            final_score = (w1 * retrieval) + (w2 * rerank_score) + (w3 * coverage) + (w4 * constraints)
+            final_score = max(0.001, min(0.999, final_score)) # Avoid absolute 0/1 for UI
+            r.score = final_score
+ 
+            r.ranking_details["final_score_components"] = {
+                "retrieval": round(retrieval, 4),
+                "reranker": round(rerank_score, 4),
+                "coverage": round(coverage, 4),
+                "constraints": round(constraints, 4),
+            }
+            r.ranking_details["reranker_weight"] = w2
+ 
+        results.sort(key=lambda item: item.score, reverse=True)
+        for i, result in enumerate(results, 1):
+            result.rank = i
+        return results
 
     def _retrieve_chunks(self, query: str, parsed: ParsedJobDescription, top_k: int) -> list[ChunkHit]:
         if self.retrieval_backend == "semantic-chunk" and self.index is not None and self.model is not None and self.chunk_metadata:
@@ -533,14 +663,24 @@ class SearchEngine:
             if parsed.preferred_skills:
                 preferred_ratio = preferred_count / max(len(parsed.preferred_skills), 1)
 
+            # Company Match Boost
+            company_boost = 0.0
+            if parsed.company:
+                if parsed.company.lower() in profile.get("combined_text", "").lower():
+                    company_boost = 0.25 
+                elif parsed.company.lower() in candidate_id.lower():
+                    company_boost = 0.15
+
+            # Adjusted weights: More emphasis on best chunk, must-have matches, and company context
             combined_score = min(
                 1.0,
-                (0.62 * best_score)
-                + (0.23 * mean_top_scores)
-                + (0.10 * must_have_ratio)
-                + (0.05 * preferred_ratio),
+                (0.55 * best_score)
+                + (0.10 * mean_top_scores)
+                + (0.20 * must_have_ratio)
+                + (0.05 * preferred_ratio)
+                + company_boost,
             )
-            if combined_score < min_score:
+            if combined_score < max(min_score, 0.05):
                 continue
 
             member_info = self._lookup_member(candidate_id, profile.get("combined_text", ""))
@@ -636,7 +776,6 @@ class SearchEngine:
 
         if parsed.must_have_skills:
             if len(matched_must_have) < len(parsed.must_have_skills):
-                status["passed"] = False
                 status["must_have_status"] = "failed"
             else:
                 status["must_have_status"] = "passed"
@@ -648,7 +787,6 @@ class SearchEngine:
             if candidate_years is None:
                 status["years_experience_status"] = "unknown"
             elif candidate_years + 0.25 < parsed.minimum_years_experience:
-                status["passed"] = False
                 status["years_experience_status"] = "failed"
             else:
                 status["years_experience_status"] = "passed"
@@ -659,7 +797,6 @@ class SearchEngine:
             if degree_rank == 0:
                 status["degree_status"] = "unknown"
             elif degree_rank < required_rank:
-                status["passed"] = False
                 status["degree_status"] = "failed"
             else:
                 status["degree_status"] = "passed"

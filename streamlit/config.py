@@ -27,10 +27,14 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
 # ---------------------------------------------------------------------------
-# Search defaults
+# Search defaults & reranker config
 # ---------------------------------------------------------------------------
 DEFAULT_TOP_K = 20
 MIN_SCORE_THRESHOLD = 0.0
+
+# Cross-encoder reranker (optional, loaded lazily in SearchEngine)
+RERANKER_ENABLED = True  # flip to True once a model is trained and saved
+RERANKER_MODEL_PATH = PROJECT_ROOT / "models" / "talentlens-cross-encoder-sft-v1"
 
 # ---------------------------------------------------------------------------
 # Predefined skill suggestions (shown in the sidebar & autocomplete)

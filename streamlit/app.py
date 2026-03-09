@@ -23,7 +23,6 @@ from components import (
     render_demo_banner,
     render_header,
     render_initial_state,
-    render_job_description_summary,
     render_results,
     render_search_bar,
     render_sidebar_filters,
@@ -118,8 +117,7 @@ if search_clicked:
         st.session_state["last_results"] = results
         st.session_state["last_job_description_analysis"] = engine.last_query_analysis
 
-if st.session_state.get("last_job_description_analysis"):
-    render_job_description_summary(st.session_state["last_job_description_analysis"])
+# Job description analysis is stored but not rendered directly anymore per user request
 
 if st.session_state["last_results"]:
     render_results(st.session_state["last_results"])
