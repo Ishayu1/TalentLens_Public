@@ -10,7 +10,7 @@ if str(STREAMLIT_DIR) not in sys.path:
 from search import SearchEngine
 
 app = FastAPI()
-engine = SearchEngine()
+engine = SearchEngine(strict_startup=True)
 
 
 class SearchRequest(BaseModel):
@@ -49,6 +49,15 @@ async def search_resumes(request: SearchRequest):
                 "top_evidence_chunks": result.top_evidence_chunks,
                 "hard_filter_status": result.hard_filter_status,
                 "ranking_details": result.ranking_details,
+                "page_count": result.page_count,
+                "company_match_status": result.company_match_status,
+                "grok_status": result.grok_status,
+                "grok_fit_score": float(result.grok_fit_score),
+                "grok_resume_quality_score": float(result.grok_resume_quality_score),
+                "grok_summary": result.grok_summary,
+                "grok_matched_requirements": result.grok_matched_requirements,
+                "grok_missing_requirements": result.grok_missing_requirements,
+                "grok_weakness_flags": result.grok_weakness_flags,
             }
             for result in results
         ],

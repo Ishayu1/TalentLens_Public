@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -21,6 +22,7 @@ try:
         DEFAULT_TOP_K,
         EMBEDDING_DIM,
         FAISS_INDEX_PATH,
+        BOARD_RESUMES_DIR,
         MEMBER_RESUMES_DIR,
         MEMBERS_CSV,
         METADATA_PATH,
@@ -39,6 +41,7 @@ except ImportError:
         DEFAULT_TOP_K,
         EMBEDDING_DIM,
         FAISS_INDEX_PATH,
+        BOARD_RESUMES_DIR,
         MEMBER_RESUMES_DIR,
         MEMBERS_CSV,
         METADATA_PATH,
@@ -57,9 +60,13 @@ PROCESSED_DIR = DATA_DIR / "processed"
 PARSED_RESUMES_PATH = PROCESSED_DIR / "resumes_parsed.json"
 RESUME_CHUNKS_PATH = PROCESSED_DIR / "resume_chunks.json"
 CHUNK_METADATA_PATH = PROJECT_ROOT / "member_chunks_metadata.json"
+MEMBER_SOURCES = {"ds3_members", "ds3_board"}
+DEFAULT_MEMBER_SOURCE = "ds3_members"
 LOCAL_MEMBER_RESUME_DIRS = [
     MEMBER_RESUMES_DIR,
+    BOARD_RESUMES_DIR,
     PROJECT_ROOT / "test" / "members",
+    PROJECT_ROOT / "test" / "board",
 ]
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "if",
@@ -218,6 +225,10 @@ def _extract_employer_names(experience_entries: list[dict]) -> list[str]:
     for entry in experience_entries or []:
         if not isinstance(entry, dict):
             continue
+        structured_company = str(entry.get("company", "")).strip()
+        if structured_company:
+            employers.append(structured_company)
+            continue
         raw_text = str(entry.get("raw_text", "")).strip()
         if not raw_text:
             continue
@@ -238,11 +249,42 @@ def _extract_employer_names(experience_entries: list[dict]) -> list[str]:
     return employers
 
 
+def _summarize_structured_entry(
+    prefix: str,
+    entry: dict[str, Any],
+    name_key: str,
+    company_key: str | None = None,
+) -> str:
+    title = str(entry.get(name_key, "")).strip()
+    company = str(entry.get(company_key, "")).strip() if company_key else ""
+    technologies = entry.get("technologies", [])
+    bullets = entry.get("bullets", [])
+    dates = entry.get("dates", [])
+    parts: list[str] = []
+    if title:
+        parts.append(f"{prefix}: {title}")
+    if company:
+        parts.append(f"Company: {company}")
+    if dates:
+        if not isinstance(dates, list):
+            dates = [str(dates)]
+        parts.append("Dates: " + ", ".join(str(item).strip() for item in dates if str(item).strip()))
+    if technologies:
+        if not isinstance(technologies, list):
+            technologies = [str(technologies)]
+        parts.append("Technologies: " + ", ".join(str(item).strip() for item in technologies if str(item).strip()))
+    if bullets:
+        if not isinstance(bullets, list):
+            bullets = [str(bullets)]
+        parts.extend(f"- {str(item).strip()}" for item in bullets if str(item).strip())
+    return "\n".join(parts).strip()
+
+
 ProgressCallback = Callable[[float, str], None]
 
 
 class SearchEngine:
-    def __init__(self):
+    def __init__(self, strict_startup: bool = False):
         self.model = None
         self.index = None
         self.resume_metadata: list[dict] = []
@@ -268,7 +310,42 @@ class SearchEngine:
         self.reranker = None
         self.reranker_loaded = False
         self._page_count_cache: dict[str, int | None] = {}
+        self.strict_startup = strict_startup
+        self._startup_issues: list[str] = []
         self._load()
+        if self.strict_startup:
+            self._enforce_required_backends()
+
+    def _record_startup_issue(self, message: str) -> None:
+        if message not in self._startup_issues:
+            self._startup_issues.append(message)
+
+    def _enforce_required_backends(self) -> None:
+        if self.demo_mode:
+            return
+
+        issues = list(self._startup_issues)
+        if not self.retrieval_backend.startswith("semantic"):
+            issues.append(
+                "Semantic retrieval backend did not load successfully. "
+                f"Current backend: {self.retrieval_backend}."
+            )
+        if RERANKER_ENABLED and not self.reranker_loaded:
+            issues.append("Cross-encoder reranker did not load successfully.")
+
+        if not issues:
+            return
+
+        details = "\n".join(f"- {issue}" for issue in dict.fromkeys(issues))
+        raise RuntimeError(
+            "TalentLens startup validation failed.\n"
+            f"Interpreter: {sys.executable}\n"
+            "The app is configured to require semantic FAISS retrieval and the reranker.\n"
+            f"{details}\n"
+            "Use the project virtualenv when launching the app, for example:\n"
+            "- ./venv/bin/streamlit run streamlit/app.py\n"
+            "- ./venv/bin/python -m uvicorn api:app --reload"
+        )
 
     def _load(self):
         if MEMBERS_CSV.exists():
@@ -304,7 +381,7 @@ class SearchEngine:
             rows = json.load(f)
 
         for row in rows:
-            if row.get("source") != "ds3_members":
+            if row.get("source") not in MEMBER_SOURCES:
                 continue
             candidate_id = row.get("candidate_id", "")
             if candidate_id:
@@ -316,7 +393,7 @@ class SearchEngine:
         with open(RESUME_CHUNKS_PATH, "r", encoding="utf-8") as f:
             rows = json.load(f)
 
-        self.chunk_candidates = [row for row in rows if row.get("source") == "ds3_members"]
+        self.chunk_candidates = [row for row in rows if row.get("source") in MEMBER_SOURCES]
         self._prepare_chunk_text_index()
 
     def _load_resume_metadata(self):
@@ -324,7 +401,7 @@ class SearchEngine:
             return
         with open(METADATA_PATH, "r", encoding="utf-8") as f:
             rows = json.load(f)
-        self.resume_metadata = [row for row in rows if row.get("source") == "ds3_members"]
+        self.resume_metadata = [row for row in rows if row.get("source") in MEMBER_SOURCES]
         self.resume_metadata_by_filename = {
             row.get("filename", ""): row for row in self.resume_metadata if row.get("filename")
         }
@@ -333,12 +410,17 @@ class SearchEngine:
         try:
             import faiss
             from sentence_transformers import SentenceTransformer
-        except Exception:
+        except Exception as exc:
             self.retrieval_backend = "lexical-chunk"
+            self._record_startup_issue(
+                "Could not import semantic retrieval dependencies "
+                f"(faiss / sentence-transformers): {exc.__class__.__name__}: {exc}"
+            )
             return
 
         if not FAISS_INDEX_PATH.exists():
             self.retrieval_backend = "lexical-chunk"
+            self._record_startup_issue(f"FAISS index file is missing: {FAISS_INDEX_PATH}")
             return
 
         metadata_rows = None
@@ -354,17 +436,28 @@ class SearchEngine:
 
         if metadata_rows is None:
             self.retrieval_backend = "lexical-chunk"
+            self._record_startup_issue(
+                f"Chunk/resume metadata is missing: expected {CHUNK_METADATA_PATH} or {METADATA_PATH}"
+            )
             return
 
         try:
             model = SentenceTransformer(MODEL_NAME, local_files_only=True)
             index = faiss.read_index(str(FAISS_INDEX_PATH))
-        except Exception:
+        except Exception as exc:
             self.retrieval_backend = "lexical-chunk"
+            self._record_startup_issue(
+                "Failed to load FAISS index or embedding model "
+                f"({MODEL_NAME}): {exc.__class__.__name__}: {exc}"
+            )
             return
 
         if len(metadata_rows) != index.ntotal:
             self.retrieval_backend = "lexical-chunk"
+            self._record_startup_issue(
+                "FAISS index and metadata length mismatch: "
+                f"{len(metadata_rows)} metadata rows vs {index.ntotal} vectors."
+            )
             return
 
         self.model = model
@@ -386,6 +479,7 @@ class SearchEngine:
         if not RERANKER_MODEL_PATH.exists():
             self.reranker = None
             self.reranker_loaded = False
+            self._record_startup_issue(f"Reranker model path is missing: {RERANKER_MODEL_PATH}")
             return
         try:
             from sentence_transformers import CrossEncoder
@@ -396,9 +490,13 @@ class SearchEngine:
                 activation_fn=None,
             )
             self.reranker_loaded = True
-        except Exception:
+        except Exception as exc:
             self.reranker = None
             self.reranker_loaded = False
+            self._record_startup_issue(
+                "Failed to load reranker model "
+                f"from {RERANKER_MODEL_PATH}: {exc.__class__.__name__}: {exc}"
+            )
 
     def _load_demo(self):
         self.demo_mode = True
@@ -554,7 +652,7 @@ class SearchEngine:
                     local_resume_path=self._resolve_resume_path(meta.get("filename", ""), meta.get("file_path", "")),
                     text_preview=text[:400],
                     full_text=text,
-                    source=meta.get("source", "ds3_members"),
+                    source=meta.get("source", DEFAULT_MEMBER_SOURCE),
                     full_name=member_info.get("full_name", meta.get("full_name", meta.get("filename", ""))),
                     major=major,
                     graduation_year=str(grad_year),
@@ -688,22 +786,44 @@ class SearchEngine:
     ) -> dict[str, Any]:
         education_entries = []
         for entry in profile.get("education_entries", [])[:2]:
-            if isinstance(entry, dict) and entry.get("raw_text"):
-                education_entries.append(str(entry["raw_text"])[:350])
+            if isinstance(entry, dict):
+                education_entries.append(str(entry.get("raw_text", ""))[:350])
 
         experience_entries = []
         for entry in profile.get("experience_entries", [])[:2]:
-            if isinstance(entry, dict) and entry.get("raw_text"):
-                experience_entries.append(str(entry["raw_text"])[:500])
+            if isinstance(entry, dict):
+                text = _summarize_structured_entry("Role", entry, "title", "company") or str(entry.get("raw_text", ""))
+                if text:
+                    experience_entries.append(text[:500])
 
         project_entries = []
         for entry in profile.get("project_entries", [])[:2]:
-            if isinstance(entry, dict) and entry.get("raw_text"):
-                project_entries.append(str(entry["raw_text"])[:500])
+            if isinstance(entry, dict):
+                text = _summarize_structured_entry("Project", entry, "name") or str(entry.get("raw_text", ""))
+                if text:
+                    project_entries.append(text[:500])
 
         skills = profile.get("skills", [])
         if not isinstance(skills, list):
             skills = [str(skills)]
+        experience_technologies = sorted(
+            {
+                str(tech).strip()
+                for entry in profile.get("experience_entries", [])
+                if isinstance(entry, dict)
+                for tech in entry.get("technologies", [])
+                if str(tech).strip()
+            }
+        )
+        project_technologies = sorted(
+            {
+                str(tech).strip()
+                for entry in profile.get("project_entries", [])
+                if isinstance(entry, dict)
+                for tech in entry.get("technologies", [])
+                if str(tech).strip()
+            }
+        )
 
         return {
             "candidate_id": result.candidate_id,
@@ -712,9 +832,12 @@ class SearchEngine:
             "graduation_year": result.graduation_year,
             "summary": profile.get("summary", ""),
             "skills": skills[:25],
+            "canonical_skills": profile.get("canonical_skills", skills[:25]),
             "education": education_entries,
             "experience": experience_entries,
             "projects": project_entries,
+            "experience_technologies": experience_technologies[:20],
+            "project_technologies": project_technologies[:20],
             "estimated_years_experience": profile.get("estimated_years_experience"),
             "company_match_status": result.company_match_status,
             "page_count": result.page_count,
@@ -901,7 +1024,7 @@ class SearchEngine:
                     section_type=row.get("section_type", "other"),
                     text=row.get("text", ""),
                     score=float(max(0.0, score)) * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
-                    source=row.get("source", "ds3_members"),
+                    source=row.get("source", DEFAULT_MEMBER_SOURCE),
                 )
             )
         return hits
@@ -931,7 +1054,7 @@ class SearchEngine:
                     section_type=row.get("section_type", "other"),
                     text=row.get("text", ""),
                     score=score * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
-                    source=row.get("source", "ds3_members"),
+                    source=row.get("source", DEFAULT_MEMBER_SOURCE),
                 )
             )
         return hits
@@ -949,7 +1072,7 @@ class SearchEngine:
                     section_type="resume",
                     text=row.get("text", "")[:500],
                     score=float(scores[idx]),
-                    source=row.get("source", "ds3_members"),
+                    source=row.get("source", DEFAULT_MEMBER_SOURCE),
                 )
             )
         return hits
@@ -1028,7 +1151,7 @@ class SearchEngine:
                     local_resume_path=self._resolve_resume_path(candidate_id, display_meta.get("file_path", profile.get("file_path", ""))),
                     text_preview=hits[0].text[:400],
                     full_text=profile.get("combined_text", ""),
-                    source=profile.get("source", "ds3_members"),
+                    source=profile.get("source", DEFAULT_MEMBER_SOURCE),
                     full_name=member_info.get("full_name", profile.get("full_name", candidate_id)),
                     major=member_info.get("major", profile.get("major", "")),
                     graduation_year=str(member_info.get("graduation_year", profile.get("graduation_year", ""))),
@@ -1148,19 +1271,42 @@ class SearchEngine:
         education_entries = parsed.get("education", [])
         project_entries = parsed.get("projects", [])
         summary = parsed.get("summary", "")
+        canonical_skills = parsed.get("canonical_skills", [])
+        if not isinstance(canonical_skills, list):
+            canonical_skills = [str(canonical_skills)] if canonical_skills else []
+        raw_skills = parsed.get("skills", [])
+        if not isinstance(raw_skills, list):
+            raw_skills = [str(raw_skills)] if raw_skills else []
+        skills = canonical_skills or raw_skills
         text_parts = []
         if meta.get("text"):
             text_parts.append(meta["text"])
-        for key in ("summary", "skills", "projects", "certifications"):
+        for key in ("summary", "certifications"):
             value = parsed.get(key)
             if isinstance(value, list):
                 text_parts.append("\n".join(str(item) for item in value))
             elif value:
                 text_parts.append(str(value))
+        if skills:
+            text_parts.append("\n".join(str(item) for item in skills))
         for section_key in ("experience", "education", "projects"):
             for item in parsed.get(section_key, []):
-                if isinstance(item, dict) and item.get("raw_text"):
+                if not isinstance(item, dict):
+                    continue
+                if section_key == "experience":
+                    text_parts.append(_summarize_structured_entry("Role", item, "title", "company"))
+                elif section_key == "projects":
+                    text_parts.append(_summarize_structured_entry("Project", item, "name"))
+                elif item.get("raw_text"):
                     text_parts.append(item["raw_text"])
+
+        employer_names = [
+            str(entry.get("company", "")).strip()
+            for entry in experience_entries
+            if isinstance(entry, dict) and str(entry.get("company", "")).strip()
+        ]
+        if not employer_names:
+            employer_names = _extract_employer_names(experience_entries)
 
         full_name = metadata.get("full_name", meta.get("full_name", candidate_id))
         major = metadata.get("major", meta.get("major", ""))
@@ -1168,20 +1314,21 @@ class SearchEngine:
         profile = {
             "candidate_id": candidate_id,
             "file_path": meta.get("file_path", parsed.get("file_path", "")),
-            "source": meta.get("source", parsed.get("source", "ds3_members")),
+            "source": meta.get("source", parsed.get("source", DEFAULT_MEMBER_SOURCE)),
             "full_name": full_name,
             "major": major,
             "graduation_year": graduation_year,
             "resume_link": metadata.get("resume_link", meta.get("resume_link", "")),
             "linkedin": metadata.get("linkedin", meta.get("linkedin", "")),
             "github": metadata.get("github", meta.get("github", "")),
-            "skills": parsed.get("skills", []),
+            "skills": skills,
+            "canonical_skills": canonical_skills,
             "summary": "\n".join(summary) if isinstance(summary, list) else str(summary or ""),
             "education": education_entries,
             "education_entries": education_entries,
             "experience_entries": experience_entries,
             "project_entries": project_entries,
-            "employer_names": _extract_employer_names(experience_entries),
+            "employer_names": employer_names,
             "location_text": (meta.get("text", "")[:300] if meta.get("text") else ""),
             "combined_text": "\n".join(part for part in text_parts if part),
             "estimated_years_experience": self._estimate_years_experience(experience_entries),

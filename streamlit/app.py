@@ -37,7 +37,7 @@ st.markdown(get_css(), unsafe_allow_html=True)
 
 @st.cache_resource(show_spinner="Loading search engine...")
 def load_engine() -> SearchEngine:
-    return SearchEngine()
+    return SearchEngine(strict_startup=True)
 
 
 engine = load_engine()

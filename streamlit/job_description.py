@@ -80,6 +80,12 @@ LOCATION_PREFIX_RE = re.compile(r"^(location|based in|office location)\s*[:\-]\s
 COMPANY_SEEKING_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,5})\s+(?:is seeking|seeks|is hiring)\b"
 )
+URL_RE = re.compile(r"https?://\S+|linkedin\.com/\S+|github\.com/\S+", re.I)
+STANDALONE_COMPANY_PREFIX_RE = re.compile(
+    r"^(?:apply|via|location|job highlights|benefits|qualifications|requirements|responsibilities|description|posted|salary)\b",
+    re.I,
+)
+STATE_CODE_RE = re.compile(r"\b[A-Z]{2}\b")
 
 
 @dataclass
@@ -149,6 +155,19 @@ def _extract_company(lines: list[str]) -> str:
             if len(val.split()) > 1 and core.lower() not in {"amazon", "google", "meta", "apple", "microsoft"}:
                 return val.rstrip(",")
             return core
+
+    if len(lines) >= 2:
+        candidate = lines[1].strip().rstrip(",")
+        if (
+            candidate
+            and len(candidate.split()) <= 6
+            and not re.search(r"\d", candidate)
+            and not URL_RE.search(candidate)
+            and not REMOTE_RE.search(candidate)
+            and not STATE_CODE_RE.search(candidate)
+            and not STANDALONE_COMPANY_PREFIX_RE.search(candidate)
+        ):
+            return candidate
     return ""
 
 
@@ -236,8 +255,13 @@ def parse_job_description(text: str) -> ParsedJobDescription:
     preferred_text = "\n".join(preferred_lines)
     full_text = "\n".join(lines)
 
+    company = _extract_company(lines)
     must_have_skills = _extract_skills(required_text) or _extract_skills(full_text)
     preferred_skills = [skill for skill in _extract_skills(preferred_text) if skill not in must_have_skills]
+    if company:
+        company_tokens = {company.lower(), company.split()[0].lower()}
+        must_have_skills = [skill for skill in must_have_skills if skill.lower() not in company_tokens]
+        preferred_skills = [skill for skill in preferred_skills if skill.lower() not in company_tokens]
     minimum_years = _extract_years(required_text or full_text)
     location, remote_policy = _extract_location(lines, full_text)
     degree_requirements = _extract_degree_requirements(full_text)
@@ -245,7 +269,7 @@ def parse_job_description(text: str) -> ParsedJobDescription:
     return ParsedJobDescription(
         raw_text=text,
         job_title=_extract_title(lines),
-        company=_extract_company(lines),
+        company=company,
         must_have_skills=must_have_skills,
         preferred_skills=preferred_skills,
         minimum_years_experience=minimum_years,
