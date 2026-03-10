@@ -77,6 +77,9 @@ DEGREE_RE = re.compile(
     re.I,
 )
 LOCATION_PREFIX_RE = re.compile(r"^(location|based in|office location)\s*[:\-]\s*(.+)$", re.I)
+COMPANY_SEEKING_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,5})\s+(?:is seeking|seeks|is hiring)\b"
+)
 
 
 @dataclass
@@ -113,28 +116,38 @@ def _extract_title(lines: list[str]) -> str:
     return ""
     
 def _extract_company(lines: list[str]) -> str:
-    # Look for common company markers or known big tech
     for line in lines[:10]:
+        seeking_match = COMPANY_SEEKING_RE.search(line)
+        if seeking_match:
+            return seeking_match.group(1).strip().rstrip(",")
+
         val = ""
-        # Handle "|" separators
-        if "|" in line:
-            parts = [p.strip() for p in line.split("|")]
-            for p in parts:
-                if any(x in p.lower() for x in ["amazon", "google", "meta", "apple", "microsoft", "netflix", "nvidia"]):
-                    val = p
-                    break
-        else:
-            # Match "Company: X"
-            match = re.search(r"\b(?:company|employer|firm)\s*[:\-]\s*([A-Z][A-Za-z0-9\.\s]+)", line, re.I)
+        for separator in ("|", "•"):
+            if separator in line:
+                parts = [p.strip() for p in line.split(separator)]
+                for part in parts:
+                    lowered = part.lower()
+                    if lowered.startswith("via "):
+                        continue
+                    if re.search(r"\b[A-Z]{2}\b", part) or re.search(r"\d", part):
+                        continue
+                    if len(part.split()) <= 6 and part[:1].isupper():
+                        val = part
+                        break
+            if val:
+                break
+
+        if not val:
+            match = re.search(r"\b(?:company|employer|firm)\s*[:\-]\s*([A-Z][A-Za-z0-9&.\s-]+)", line, re.I)
             if match:
-                 val = match.group(1).strip()
-        
+                val = match.group(1).strip()
+
         if val:
-            # Clean it up: "Amazon.com Services LLC" -> "Amazon"
             core = val.split(".")[0].split()[0].strip().rstrip(",").rstrip(".")
-            # Keep meaningful second words for some
             if core.lower() in ["hey", "the", "a"] and len(val.split()) > 1:
                 return " ".join(val.split()[:2])
+            if len(val.split()) > 1 and core.lower() not in {"amazon", "google", "meta", "apple", "microsoft"}:
+                return val.rstrip(",")
             return core
     return ""
 

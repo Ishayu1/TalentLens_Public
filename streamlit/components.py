@@ -268,6 +268,32 @@ Score: `{chunk.get('score', 0.0):.3f}`"
         st.markdown(f"> {chunk.get('text', '').strip()[:700]}")
 
 
+def _render_grok_details(r: ResumeResult):
+    if not r.grok_status or r.grok_status == "not_requested":
+        return
+    st.markdown("### Grok Assessment")
+    st.markdown(f"**Status:** {r.grok_status}")
+    if r.company_match_status and r.company_match_status != "not_requested":
+        st.markdown(f"**Company match:** {r.company_match_status.replace('_', ' ')}")
+    if r.page_count is None:
+        st.markdown("**Page count:** unknown")
+    else:
+        st.markdown(f"**Page count:** {r.page_count}")
+
+    if r.grok_fit_score:
+        st.markdown(f"**Fit score:** {r.grok_fit_score * 100:.0f}%")
+    if r.grok_resume_quality_score:
+        st.markdown(f"**Resume quality score:** {r.grok_resume_quality_score * 100:.0f}%")
+    if r.grok_summary:
+        st.markdown(r.grok_summary)
+    if r.grok_matched_requirements:
+        st.markdown("**Matched requirements:** " + ", ".join(r.grok_matched_requirements))
+    if r.grok_missing_requirements:
+        st.markdown("**Missing or unclear requirements:** " + ", ".join(r.grok_missing_requirements))
+    if r.grok_weakness_flags:
+        st.markdown("**Weakness flags:** " + ", ".join(r.grok_weakness_flags))
+
+
 def _render_detail_panel(r: ResumeResult):
     col1, col2 = st.columns(2)
     with col1:
@@ -289,6 +315,11 @@ def _render_detail_panel(r: ResumeResult):
     if r.matched_skills:
         skills_html = "".join(f'<span class="matched-skill">{s}</span>' for s in r.matched_skills)
         st.markdown(f'<div style="margin-top:0.6rem;"><span class="detail-label">Matched Skills:</span><br/>{skills_html}</div>', unsafe_allow_html=True)
+
+    _render_filter_status(r.hard_filter_status)
+    _render_ranking_details(r.ranking_details)
+    _render_grok_details(r)
+    _render_evidence_chunks(r.top_evidence_chunks)
 
 
 

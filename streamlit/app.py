@@ -42,6 +42,19 @@ def load_engine() -> SearchEngine:
 
 engine = load_engine()
 
+
+def run_search_with_progress(**search_kwargs):
+    progress_container = st.container()
+    with progress_container:
+        progress_bar = st.progress(0, text="Starting search...")
+
+    def on_progress(progress: float, message: str):
+        progress_bar.progress(int(progress * 100), text=message)
+
+    results = engine.search(progress_callback=on_progress, **search_kwargs)
+    progress_bar.progress(100, text="Search complete")
+    return results
+
 if st.session_state.get("_pending_clear"):
     st.session_state["_pending_clear"] = False
     st.session_state["selected_skills"] = []
@@ -92,28 +105,26 @@ if search_clicked:
         selected_skills = st.session_state["selected_skills"]
         if selected_skills:
             search_text = ", ".join(selected_skills)
-            with st.spinner("Searching resumes..."):
-                results = engine.search(
-                    query=search_text,
-                    top_k=top_k,
-                    skill_filters=selected_skills,
-                    grad_year_filter=grad_year_filter,
-                    major_filter=major_filter,
-                )
+            results = run_search_with_progress(
+                query=search_text,
+                top_k=top_k,
+                skill_filters=selected_skills,
+                grad_year_filter=grad_year_filter,
+                major_filter=major_filter,
+            )
             st.session_state["last_results"] = results
             st.session_state["last_job_description_analysis"] = None
             if has_query:
                 st.rerun()
 
     elif input_mode == "Job Description" and has_query:
-        with st.spinner("Parsing job description and retrieving candidates..."):
-            results = engine.search(
-                query=query.strip(),
-                top_k=top_k,
-                grad_year_filter=grad_year_filter,
-                major_filter=major_filter,
-                input_mode="Job Description",
-            )
+        results = run_search_with_progress(
+            query=query.strip(),
+            top_k=top_k,
+            grad_year_filter=grad_year_filter,
+            major_filter=major_filter,
+            input_mode="Job Description",
+        )
         st.session_state["last_results"] = results
         st.session_state["last_job_description_analysis"] = engine.last_query_analysis
 

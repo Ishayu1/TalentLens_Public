@@ -1,55 +1,82 @@
-import os
+from __future__ import annotations
+
+import hashlib
 import json
+import os
+import threading
+from collections import OrderedDict
+from copy import deepcopy
+from threading import Lock
+from typing import Any
+
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-# xAI docs use "grok-4-1-fast-reasoning"; try hyphenated form first
 GROK_MODEL_CANDIDATES = [
     "grok-4-1-fast-reasoning",
     "grok-4.1-fast-reasoning",
 ]
 
-DEFAULT_RECRUITER_ASSESSMENT = {
-    "impact_score": 0.0,
-    "technology_fit_score": 0.0,
-    "keyword_alignment_score": 0.0,
-    "role_fit_score": 0.0,
-    "overall_recommendation": "insufficient_signal",
-    "evidence": "",
-}
-
-DEFAULT_RESUME_RUBRIC_ASSESSMENT = {
-    "ats_format_score": 0.0,
-    "section_quality_score": 0.0,
+DEFAULT_CANDIDATE_PACKET_ASSESSMENT = {
+    "status": "unavailable",
+    "qualification_match_score": 0.0,
+    "company_relevance_score": 0.0,
+    "experience_relevance_score": 0.0,
     "bullet_quality_score": 0.0,
-    "technical_relevance_score": 0.0,
-    "truthfulness_score": 0.0,
     "project_strength_score": 0.0,
-    "overall_resume_quality_score": 0.0,
-    "hard_fail_flags": [],
-    "revision_flags": [],
-    "strengths": [],
-    "risks": [],
+    "resume_quality_score": 0.0,
+    "matched_requirements": [],
+    "missing_requirements": [],
+    "weakness_flags": [],
     "summary": "",
 }
+
+_ASSESSMENT_REQUIRED_KEYS = {
+    "qualification_match_score",
+    "company_relevance_score",
+    "experience_relevance_score",
+    "bullet_quality_score",
+    "project_strength_score",
+    "resume_quality_score",
+    "matched_requirements",
+    "missing_requirements",
+    "weakness_flags",
+    "summary",
+}
+_ASSESSMENT_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_ASSESSMENT_CACHE_SIZE = 256
+_ASSESSMENT_CACHE_LOCK = Lock()
+_THREAD_LOCAL = threading.local()
 
 
 def _resolve_api_key(api_key: str | None = None) -> str | None:
     if api_key:
         return api_key
-    return os.getenv("XAI_API_KEY") or st.session_state.get("XAI_API_KEY")
+    session_state = getattr(st, "session_state", None)
+    if session_state is not None:
+        value = session_state.get("XAI_API_KEY")
+        if value:
+            return value
+    return os.getenv("XAI_API_KEY")
 
 
-def _build_client(api_key: str | None = None):
-    resolved_api_key = _resolve_api_key(api_key)
-    if not resolved_api_key:
-        return None
+def has_grok_api_key(api_key: str | None = None) -> bool:
+    return bool(_resolve_api_key(api_key))
 
-    return resolved_api_key
+
+def _build_client(api_key: str | None = None) -> str | None:
+    return _resolve_api_key(api_key)
+
+
+def _get_session() -> requests.Session:
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_LOCAL.session = session
+    return session
 
 
 def _report_error(message: str):
@@ -60,12 +87,13 @@ def _report_error(message: str):
         print(message)
 
 
-def _create_chat_completion(client, messages: list[dict], temperature: float):
-    # xAI docs: only model, messages, stream (no temperature in official examples)
+def _create_chat_completion(client: str, messages: list[dict], temperature: float):
+    del temperature
     last_error = None
+    session = _get_session()
     for model_name in GROK_MODEL_CANDIDATES:
         try:
-            response = requests.post(
+            response = session.post(
                 "https://api.x.ai/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {client}",
@@ -76,7 +104,7 @@ def _create_chat_completion(client, messages: list[dict], temperature: float):
                     "messages": messages,
                     "stream": False,
                 },
-                timeout=120,
+                timeout=45,
             )
             response.raise_for_status()
             return response.json()
@@ -111,7 +139,10 @@ def _extract_json_payload(raw_text: str) -> dict:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("No JSON object found in Grok response.")
 
-    return json.loads(cleaned[start : end + 1])
+    payload = json.loads(cleaned[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("Grok response JSON must be an object.")
+    return payload
 
 
 def _coerce_score(value) -> float:
@@ -129,25 +160,58 @@ def _coerce_list(value) -> list[str]:
         return [value.strip()]
     return []
 
-def extract_skills_with_grok(job_description: str, api_key: str | None = None) -> list[str]:
-    """
-    Sends the job description to Grok AI to extract a list of required skills.
-    Args:
-        job_description: The full text of the job posting.
-        api_key: The X.AI API key. If None, looks for it in environment variables.
-    Returns:
-        A list of skill strings (e.g., ["Python", "AWS", "Machine Learning"]).
-    """
-    api_key = _resolve_api_key(api_key)
 
+def _normalize_assessment(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_keys = sorted(_ASSESSMENT_REQUIRED_KEYS - payload.keys())
+    if missing_keys:
+        raise ValueError(f"Missing keys in Grok response: {', '.join(missing_keys)}")
+
+    assessment = deepcopy(DEFAULT_CANDIDATE_PACKET_ASSESSMENT)
+    assessment["status"] = "ok"
+    assessment["qualification_match_score"] = _coerce_score(payload.get("qualification_match_score"))
+    assessment["company_relevance_score"] = _coerce_score(payload.get("company_relevance_score"))
+    assessment["experience_relevance_score"] = _coerce_score(payload.get("experience_relevance_score"))
+    assessment["bullet_quality_score"] = _coerce_score(payload.get("bullet_quality_score"))
+    assessment["project_strength_score"] = _coerce_score(payload.get("project_strength_score"))
+    assessment["resume_quality_score"] = _coerce_score(payload.get("resume_quality_score"))
+    assessment["matched_requirements"] = _coerce_list(payload.get("matched_requirements"))
+    assessment["missing_requirements"] = _coerce_list(payload.get("missing_requirements"))
+    assessment["weakness_flags"] = _coerce_list(payload.get("weakness_flags"))
+    assessment["summary"] = str(payload.get("summary", "")).strip()
+    return assessment
+
+
+def _assessment_cache_key(job_description: str, candidate_id: str) -> tuple[str, str]:
+    digest = hashlib.sha1(job_description.encode("utf-8")).hexdigest()
+    return digest, candidate_id
+
+
+def _read_cached_assessment(job_description: str, candidate_id: str) -> dict[str, Any] | None:
+    key = _assessment_cache_key(job_description, candidate_id)
+    with _ASSESSMENT_CACHE_LOCK:
+        cached = _ASSESSMENT_CACHE.get(key)
+        if cached is None:
+            return None
+        _ASSESSMENT_CACHE.move_to_end(key)
+        return deepcopy(cached)
+
+
+def _store_cached_assessment(job_description: str, candidate_id: str, assessment: dict[str, Any]) -> None:
+    key = _assessment_cache_key(job_description, candidate_id)
+    with _ASSESSMENT_CACHE_LOCK:
+        _ASSESSMENT_CACHE[key] = deepcopy(assessment)
+        _ASSESSMENT_CACHE.move_to_end(key)
+        while len(_ASSESSMENT_CACHE) > _ASSESSMENT_CACHE_SIZE:
+            _ASSESSMENT_CACHE.popitem(last=False)
+
+
+def extract_skills_with_grok(job_description: str, api_key: str | None = None) -> list[str]:
+    api_key = _resolve_api_key(api_key)
     if not api_key:
-        # Fallback/Mock if no key provided yet
-        print("[Grok] No API key found. Returning empty list.")
         return []
 
     try:
         client = _build_client(api_key)
-
         prompt = (
             "Review the following job description like a seasoned technical recruiter. "
             "Extract the most resume-searchable signals that separate strong candidates: "
@@ -176,188 +240,59 @@ def extract_skills_with_grok(job_description: str, api_key: str | None = None) -
         )
 
         extracted_text = response["choices"][0]["message"]["content"]
-        skills = [s.strip() for s in extracted_text.split(",") if s.strip()]
-        return skills
-
-    except Exception as e:
-        _report_error(f"Error calling Grok AI: {e}")
+        return [skill.strip() for skill in extracted_text.split(",") if skill.strip()]
+    except Exception as exc:
+        _report_error(f"Error calling Grok AI: {exc}")
         return []
-def get_explanation_with_grok(job_description: str, candidate_text: str, candidate_name: str, api_key: str | None = None) -> str:
-    """
-    Sends the job description and candidate resume to Grok AI to explain why the candidate is a top match.
-    """
-    api_key = _resolve_api_key(api_key)
-
-    if not api_key:
-        return "Grok API key missing. Cannot generate explanation."
-
-    try:
-        client = _build_client(api_key)
-
-        prompt = (
-            f"Write a recruiter-facing match summary for {candidate_name}. In 2-3 concise "
-            "sentences, explain how the candidate stacks up against the job description using "
-            "this rubric in order: impact and measurable outcomes, relevance of technologies "
-            "used, and keyword/role alignment. Sound like a seasoned technical recruiter: "
-            "specific, evidence-based, and balanced. If there is a material gap, mention it briefly.\n\n"
-            f"Job Description:\n{job_description[:1200]}\n\n"
-            f"Candidate Resume Content:\n{candidate_text[:2500]}"
-        )
-
-        response = _create_chat_completion(
-            client,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a seasoned technical recruiter who writes concise, high-signal "
-                        "candidate evaluations for hiring managers."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-        )
-
-        return response["choices"][0]["message"]["content"].strip()
-
-    except Exception as e:
-        return f"Could not generate Grok explanation: {str(e)}"
 
 
-def assess_candidate_with_grok(
+def assess_candidate_packet_with_grok(
     job_description: str,
-    candidate_text: str,
-    candidate_name: str,
+    parsed_requirements: dict[str, Any],
+    candidate_packet: dict[str, Any],
     api_key: str | None = None,
-) -> dict:
-    """
-    Returns a structured recruiter assessment used to rerank semantic results.
-    """
-    api_key = _resolve_api_key(api_key)
+) -> dict[str, Any]:
+    candidate_id = str(candidate_packet.get("candidate_id", "")).strip()
+    if candidate_id:
+        cached = _read_cached_assessment(job_description, candidate_id)
+        if cached is not None:
+            return cached
 
+    api_key = _resolve_api_key(api_key)
     if not api_key:
-        return DEFAULT_RECRUITER_ASSESSMENT.copy()
+        return deepcopy(DEFAULT_CANDIDATE_PACKET_ASSESSMENT)
 
     try:
         client = _build_client(api_key)
         prompt = (
-            f"Evaluate {candidate_name} like a seasoned technical recruiter for the job "
-            "description below. Score the candidate from 0 to 10 on impact, technology fit, "
-            "keyword alignment, and role fit. Favor shipped work, ownership, measurable results, "
-            "and direct experience with the job's core stack. Be conservative: do not inflate scores "
-            "for weak or implied evidence.\n\n"
-            "Return ONLY valid JSON with exactly these keys:\n"
-            '{'
-            '"impact_score": number, '
-            '"technology_fit_score": number, '
-            '"keyword_alignment_score": number, '
-            '"role_fit_score": number, '
-            '"overall_recommendation": string, '
-            '"evidence": string'
-            '}\n\n'
-            "Keep `overall_recommendation` short, such as strong_match, good_match, mixed_match, "
-            "or weak_match. Keep `evidence` to one concise sentence.\n\n"
-            f"Job Description:\n{job_description[:1200]}\n\n"
-            f"Candidate Resume Content:\n{candidate_text[:3000]}"
-        )
-
-        response = _create_chat_completion(
-            client,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a seasoned technical recruiter who scores resumes against "
-                        "job descriptions using evidence from the resume only."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-        )
-
-        payload = _extract_json_payload(response["choices"][0]["message"]["content"])
-        assessment = DEFAULT_RECRUITER_ASSESSMENT.copy()
-        assessment["impact_score"] = _coerce_score(payload.get("impact_score"))
-        assessment["technology_fit_score"] = _coerce_score(payload.get("technology_fit_score"))
-        assessment["keyword_alignment_score"] = _coerce_score(payload.get("keyword_alignment_score"))
-        assessment["role_fit_score"] = _coerce_score(payload.get("role_fit_score"))
-        assessment["overall_recommendation"] = str(
-            payload.get("overall_recommendation", assessment["overall_recommendation"])
-        ).strip() or assessment["overall_recommendation"]
-        assessment["evidence"] = str(payload.get("evidence", "")).strip()
-        return assessment
-
-    except Exception as e:
-        return {
-            **DEFAULT_RECRUITER_ASSESSMENT,
-            "evidence": f"Could not generate recruiter assessment: {str(e)}",
-        }
-
-
-def assess_resume_quality_with_grok(
-    job_description: str,
-    candidate_text: str,
-    candidate_name: str,
-    api_key: str | None = None,
-) -> dict:
-    """
-    Returns a structured ATS and resume-quality assessment for reranking.
-    """
-    api_key = _resolve_api_key(api_key)
-
-    if not api_key:
-        return DEFAULT_RESUME_RUBRIC_ASSESSMENT.copy()
-
-    try:
-        client = _build_client(api_key)
-        prompt = (
-            f"Score {candidate_name}'s resume against the job description and this resume-review rubric. "
-            "Assume the candidate is an early-career software or CS applicant unless the resume clearly shows otherwise. "
-            "Judge from the resume text only and be conservative.\n\n"
-            "Rubric priorities:\n"
-            "- one-page, ATS-friendly, reverse-chronological, standard-heading resume\n"
-            "- strong technical skills section near the top\n"
-            "- education near the top for students\n"
-            "- bullets should be action + work + result, with quantification whenever supported\n"
-            "- projects should demonstrate real technical depth, ownership, deployment, users, performance, or measurable impact\n"
-            "- content should be tailored to the job description using truthful keywords\n"
-            "- unsupported or exaggerated claims are a serious risk\n\n"
-            "Hard-fail categories to detect when evidence supports them:\n"
-            "- ats_format_risk\n"
-            "- not_tailored_to_role\n"
-            "- unsupported_or_exaggerated_skills\n\n"
-            "Revision flag categories to detect when evidence supports them:\n"
-            "- weak_or_unquantified_bullets\n"
-            "- irrelevant_content_crowding_out_technical_evidence\n"
-            "- missing_or_weak_projects\n"
-            "- weak_skills_section\n"
-            "- weak_section_order_or_missing_standard_headings\n\n"
+            "Score this early-career technical candidate against the job description. "
+            "Judge only from resume evidence. Do not invent facts. When a requirement "
+            "cannot be confirmed, treat it as unclear and place it in missing_requirements "
+            "with an 'unclear:' prefix rather than assuming it is met.\n\n"
+            "Resume review rubric:\n"
+            "- Experience bullets should begin with strong action language, stay concise, and emphasize accomplishments.\n"
+            "- Strong bullets follow action + what was built or improved + how it was done + result or impact.\n"
+            "- Quantified outcomes are stronger than vague claims.\n"
+            "- Project entries should show project name, technologies, and 2 to 4 meaningful bullets.\n"
+            "- Projects are stronger when they show deployment, real users, measurable performance, open-source contribution, or clear ownership.\n"
+            "- Weak bullets include phrases like worked on, helped with, or responsible for without technical substance or outcome.\n\n"
             "Return ONLY valid JSON with exactly these keys:\n"
             "{"
-            "\"ats_format_score\": number, "
-            "\"section_quality_score\": number, "
+            "\"qualification_match_score\": number, "
+            "\"company_relevance_score\": number, "
+            "\"experience_relevance_score\": number, "
             "\"bullet_quality_score\": number, "
-            "\"technical_relevance_score\": number, "
-            "\"truthfulness_score\": number, "
             "\"project_strength_score\": number, "
-            "\"overall_resume_quality_score\": number, "
-            "\"hard_fail_flags\": string[], "
-            "\"revision_flags\": string[], "
-            "\"strengths\": string[], "
-            "\"risks\": string[], "
+            "\"resume_quality_score\": number, "
+            "\"matched_requirements\": string[], "
+            "\"missing_requirements\": string[], "
+            "\"weakness_flags\": string[], "
             "\"summary\": string"
             "}\n\n"
-            "Scoring guidance:\n"
-            "- 9-10 means excellent evidence\n"
-            "- 7-8 means strong with minor gaps\n"
-            "- 5-6 means mixed or inconsistent\n"
-            "- 3-4 means weak\n"
-            "- 0-2 means severe issue or missing evidence\n\n"
-            "Keep strengths and risks to at most 3 short items each. Keep summary to 1-2 concise sentences.\n\n"
-            f"Job Description:\n{job_description[:1500]}\n\n"
-            f"Candidate Resume Content:\n{candidate_text[:5000]}"
+            "Use 0 to 10 scoring where 10 is excellent evidence and 0 is absent or severely weak.\n\n"
+            f"Parsed job requirements:\n{json.dumps(parsed_requirements, ensure_ascii=True)}\n\n"
+            f"Candidate packet:\n{json.dumps(candidate_packet, ensure_ascii=True)}\n\n"
+            f"Original job description:\n{job_description[:2500]}"
         )
 
         response = _create_chat_completion(
@@ -366,8 +301,8 @@ def assess_resume_quality_with_grok(
                 {
                     "role": "system",
                     "content": (
-                        "You are a seasoned technical recruiter and ATS resume reviewer. "
-                        "Score resume quality, tailoring, and risk signals using only evidence present in the resume text."
+                        "You are a rigorous technical recruiter. Score candidates conservatively, "
+                        "ground everything in resume evidence, and avoid guessing."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -376,23 +311,13 @@ def assess_resume_quality_with_grok(
         )
 
         payload = _extract_json_payload(response["choices"][0]["message"]["content"])
-        assessment = DEFAULT_RESUME_RUBRIC_ASSESSMENT.copy()
-        assessment["ats_format_score"] = _coerce_score(payload.get("ats_format_score"))
-        assessment["section_quality_score"] = _coerce_score(payload.get("section_quality_score"))
-        assessment["bullet_quality_score"] = _coerce_score(payload.get("bullet_quality_score"))
-        assessment["technical_relevance_score"] = _coerce_score(payload.get("technical_relevance_score"))
-        assessment["truthfulness_score"] = _coerce_score(payload.get("truthfulness_score"))
-        assessment["project_strength_score"] = _coerce_score(payload.get("project_strength_score"))
-        assessment["overall_resume_quality_score"] = _coerce_score(payload.get("overall_resume_quality_score"))
-        assessment["hard_fail_flags"] = _coerce_list(payload.get("hard_fail_flags"))
-        assessment["revision_flags"] = _coerce_list(payload.get("revision_flags"))
-        assessment["strengths"] = _coerce_list(payload.get("strengths"))
-        assessment["risks"] = _coerce_list(payload.get("risks"))
-        assessment["summary"] = str(payload.get("summary", "")).strip()
+        assessment = _normalize_assessment(payload)
+        if candidate_id:
+            _store_cached_assessment(job_description, candidate_id, assessment)
         return assessment
-
-    except Exception as e:
+    except Exception as exc:
         return {
-            **DEFAULT_RESUME_RUBRIC_ASSESSMENT,
-            "risks": [f"Could not generate resume rubric assessment: {str(e)}"],
+            **deepcopy(DEFAULT_CANDIDATE_PACKET_ASSESSMENT),
+            "status": "error",
+            "summary": f"Could not generate Grok assessment: {exc}",
         }

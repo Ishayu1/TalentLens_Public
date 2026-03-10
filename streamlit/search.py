@@ -4,10 +4,11 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,7 @@ try:
         RERANKER_MODEL_PATH,
     )
     from job_description import ParsedJobDescription, parse_job_description
+    from grok_utils import assess_candidate_packet_with_grok, has_grok_api_key
 except ImportError:
     from streamlit.config import (
         DATA_DIR,
@@ -48,6 +50,7 @@ except ImportError:
         RERANKER_MODEL_PATH,
     )
     from streamlit.job_description import ParsedJobDescription, parse_job_description
+    from streamlit.grok_utils import assess_candidate_packet_with_grok, has_grok_api_key
 
 
 PROCESSED_DIR = DATA_DIR / "processed"
@@ -72,6 +75,27 @@ SECTION_WEIGHTS = {
     "contact": 0.2,
 }
 _SKILL_PATTERNS: dict[str, re.Pattern] = {}
+COMPANY_SUFFIXES = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "llc",
+    "ltd",
+    "limited",
+    "plc",
+    "lp",
+}
+COMPANY_LOCATION_RE = re.compile(
+    r"\b(?:remote|hybrid|on[- ]site|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b.*$"
+)
+FINAL_PAGE_PENALTY = 0.04
+GROK_TOP_N = 10
+GROK_MAX_WORKERS = max(1, min(8, int(os.getenv("TALENTLENS_GROK_MAX_WORKERS", "6"))))
+STRONG_COMPANY_BOOST = 0.18
+WEAK_COMPANY_MENTION_BOOST = 0.05
 
 
 @dataclass
@@ -104,6 +128,17 @@ class ResumeResult:
     top_evidence_chunks: list[dict] = field(default_factory=list)
     hard_filter_status: dict = field(default_factory=dict)
     reranker_score: float = 0.0
+    retrieval_score: float = 0.0
+    must_have_coverage: float = 0.0
+    page_count: int | None = None
+    company_match_status: str = "not_requested"
+    grok_status: str = "not_requested"
+    grok_fit_score: float = 0.0
+    grok_resume_quality_score: float = 0.0
+    grok_summary: str = ""
+    grok_matched_requirements: list[str] = field(default_factory=list)
+    grok_missing_requirements: list[str] = field(default_factory=list)
+    grok_weakness_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -144,6 +179,68 @@ def _tokenize_text(text: str) -> list[str]:
     ]
 
 
+def _normalize_company_name(name: str) -> str:
+    cleaned = (name or "").lower().replace("&", " and ")
+    cleaned = re.sub(r"[^a-z0-9\s]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    while tokens and tokens[-1] in COMPANY_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _normalize_free_text(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _company_names_equivalent(left: str, right: str) -> bool:
+    normalized_left = _normalize_company_name(left)
+    normalized_right = _normalize_company_name(right)
+    if not normalized_left or not normalized_right:
+        return False
+    if normalized_left == normalized_right:
+        return True
+
+    left_tokens = normalized_left.split()
+    right_tokens = normalized_right.split()
+    if len(left_tokens) == 1 and normalized_left in normalized_right:
+        return True
+    if len(right_tokens) == 1 and normalized_right in normalized_left:
+        return True
+    return False
+
+
+def _extract_employer_names(experience_entries: list[dict]) -> list[str]:
+    employers: list[str] = []
+    for entry in experience_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        raw_text = str(entry.get("raw_text", "")).strip()
+        if not raw_text:
+            continue
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        company_line = lines[1]
+        parts = re.split(r"\s{2,}", company_line, maxsplit=1)
+        employer = parts[0].strip()
+        if len(parts) == 1:
+            employer = re.sub(
+                r"\s+(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2}|Remote|Hybrid|On[- ]site)$",
+                "",
+                employer,
+            ).strip(" -|,")
+        if employer:
+            employers.append(employer)
+    return employers
+
+
+ProgressCallback = Callable[[float, str], None]
+
+
 class SearchEngine:
     def __init__(self):
         self.model = None
@@ -170,6 +267,7 @@ class SearchEngine:
         self.retrieval_backend = "uninitialized"
         self.reranker = None
         self.reranker_loaded = False
+        self._page_count_cache: dict[str, int | None] = {}
         self._load()
 
     def _load(self):
@@ -344,14 +442,25 @@ class SearchEngine:
         major_filter: str | None = None,
         input_mode: str = "Skills",
         api_key: str | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> list[ResumeResult]:
-        del api_key
         self.last_query_analysis = None
         if self.demo_mode:
             return self._search_demo(query, top_k, skill_filters, grad_year_filter, major_filter)
         if input_mode == "Job Description":
-            return self._search_job_description(query, top_k, min_score, grad_year_filter, major_filter)
-        return self._search_skills(query, top_k, min_score, skill_filters, grad_year_filter, major_filter)
+            return self._search_job_description(
+                query,
+                top_k,
+                min_score,
+                grad_year_filter,
+                major_filter,
+                api_key,
+                progress_callback,
+            )
+        self._emit_progress(progress_callback, 0.1, "Matching skill filters")
+        results = self._search_skills(query, top_k, min_score, skill_filters, grad_year_filter, major_filter)
+        self._emit_progress(progress_callback, 1.0, "Search complete")
+        return results
 
     def _search_job_description(
         self,
@@ -360,15 +469,20 @@ class SearchEngine:
         min_score: float,
         grad_year_filter: str | None,
         major_filter: str | None,
+        api_key: str | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> list[ResumeResult]:
+        self._emit_progress(progress_callback, 0.05, "Parsing job description")
         parsed = parse_job_description(query)
-        # Increase K for better recall across more candidates
         chunk_fetch_k = max(top_k * 10, 250)
+        candidate_pool_limit = max(top_k * 3, 30)
+        self._emit_progress(progress_callback, 0.15, "Retrieving resume evidence")
         chunk_hits = self._retrieve_chunks(query, parsed, top_k=chunk_fetch_k)
+        self._emit_progress(progress_callback, 0.35, "Aggregating candidate pool")
         results = self._aggregate_chunk_hits(
             chunk_hits=chunk_hits,
             parsed=parsed,
-            top_k=top_k,
+            top_k=candidate_pool_limit,
             min_score=min_score,
             grad_year_filter=grad_year_filter,
             major_filter=major_filter,
@@ -380,13 +494,25 @@ class SearchEngine:
                 "top_k_chunks": chunk_fetch_k,
                 "retrieved_chunks": len(chunk_hits),
                 "shortlisted_candidates": len(results),
+                "candidate_pool_limit": candidate_pool_limit,
                 "reranker_active": self.reranker_loaded,
+                "grok_top_n": GROK_TOP_N,
             },
         }
-        # Reranking
         if self.reranker_loaded:
+            self._emit_progress(progress_callback, 0.55, "Reranking shortlisted candidates")
             results = self._rerank(query, results, parsed)
-        
+        self._emit_progress(progress_callback, 0.65, "Evaluating top candidates with Grok")
+        results = self._apply_grok_scores(
+            query,
+            results,
+            parsed,
+            top_n=GROK_TOP_N,
+            api_key=api_key,
+            final_top_k=top_k,
+            progress_callback=progress_callback,
+        )
+        self._emit_progress(progress_callback, 1.0, "Search complete")
         return results[:top_k]
 
     def _search_skills(
@@ -436,6 +562,7 @@ class SearchEngine:
                     linkedin=member_info.get("linkedin", meta.get("linkedin", "")),
                     github=member_info.get("github", meta.get("github", "")),
                     matched_skills=matched,
+                    retrieval_score=final_score,
                     top_evidence_chunks=[
                         {
                             "section_type": "resume",
@@ -466,87 +593,286 @@ class SearchEngine:
         """Second-stage reranking with a fine-tuned CrossEncoder."""
         if not self.reranker_loaded or self.reranker is None or not results:
             return results
- 
+
         pairs: list[tuple[str, str]] = []
-        # Synthesize a cleaner query: Company + Title + Must Haves
         must_haves = []
         parsed_company = ""
-        
+
         if parsed:
             must_haves = parsed.must_have_skills
             parsed_company = parsed.company
         else:
-            # Fallback if parsed not provided
             must_haves = (getattr(results[0], "hard_filter_status", {}) or {}).get("matched_must_have_skills", []) or []
             parsed_company = (getattr(self, "last_query_analysis", {}) or {}).get("company", "")
 
         prefix = f"{parsed_company} " if parsed_company else ""
         clean_query = f"{prefix}{query.splitlines()[0]} | {', '.join(must_haves)}"
-        
+
         for r in results:
             evidence_text = ""
             if r.top_evidence_chunks:
-                # Join top 5 chunks for even more context
                 evidence_text = "\n".join(str(h.get("text", "")).strip() for h in r.top_evidence_chunks[:5])
             if not evidence_text:
                 evidence_text = r.full_text or r.text_preview or ""
             pairs.append((clean_query, evidence_text[:2000]))
- 
+
         try:
             raw_scores = self.reranker.predict(pairs)
-            import numpy as np
-            # apply sigmoid to normalize scores close to [0,1]
             scores = 1.0 / (1.0 + np.exp(-np.array(raw_scores)))
         except Exception:
             return results
- 
-        w1 = 0.50 # retrieval + company boost
-        w2 = 0.20 # reranker
-        w3 = 0.20
-        w4 = 0.10
- 
+
         for r, s in zip(results, scores):
             rerank_score = float(s)
             r.reranker_score = rerank_score
             r.ranking_details["reranker_score"] = round(rerank_score, 4)
             r.ranking_details["reranker_model"] = "talentlens-cross-encoder-sft-v1"
- 
-            # Use the already boosted/weighted score from aggregation as retrieval base
-            # This ensures company boost and must-have ratios are preserved
-            retrieval = float(r.score)
-            coverage = 0.0
-            constraints = 0.0
- 
-            hard_filters = getattr(r, "hard_filter_status", {}) or {}
-            # Simplified coverage: use what we already have in ranking_details if available
-            if r.ranking_details:
-                total_must = r.ranking_details.get("total_must_have_skills", 0)
-                matched_must = r.ranking_details.get("matched_must_have_count", 0)
-                if total_must > 0:
-                    coverage = matched_must / total_must
-            
-            if hard_filters:
-                if hard_filters.get("passed") is True:
-                    constraints = 0.05
-                elif hard_filters.get("must_have_status") == "failed" or hard_filters.get("degree_status") == "failed" or hard_filters.get("years_experience_status") == "failed":
-                    constraints = -0.10
- 
-            final_score = (w1 * retrieval) + (w2 * rerank_score) + (w3 * coverage) + (w4 * constraints)
-            final_score = max(0.001, min(0.999, final_score)) # Avoid absolute 0/1 for UI
-            r.score = final_score
- 
-            r.ranking_details["final_score_components"] = {
+
+            retrieval = float(r.retrieval_score or r.ranking_details.get("retrieval_score", r.score))
+            coverage = float(r.must_have_coverage)
+            if parsed is None:
+                pre_grok_score = (0.80 * retrieval) + (0.20 * rerank_score)
+            else:
+                pre_grok_score = (0.65 * retrieval) + (0.20 * rerank_score) + (0.15 * coverage)
+
+            r.score = max(0.001, min(0.999, pre_grok_score))
+            r.ranking_details["pre_grok_score"] = round(r.score, 4)
+            r.ranking_details["pre_grok_components"] = {
                 "retrieval": round(retrieval, 4),
                 "reranker": round(rerank_score, 4),
-                "coverage": round(coverage, 4),
-                "constraints": round(constraints, 4),
+                "must_have_coverage": round(coverage, 4),
             }
-            r.ranking_details["reranker_weight"] = w2
- 
+
         results.sort(key=lambda item: item.score, reverse=True)
         for i, result in enumerate(results, 1):
             result.rank = i
         return results
+
+    def _get_resume_page_count(self, local_resume_path: str) -> int | None:
+        if not local_resume_path:
+            return None
+        if local_resume_path in self._page_count_cache:
+            return self._page_count_cache[local_resume_path]
+        try:
+            try:
+                import fitz
+            except ImportError:
+                import pymupdf as fitz
+
+            with fitz.open(local_resume_path) as doc:
+                page_count = int(doc.page_count)
+        except Exception:
+            page_count = None
+        self._page_count_cache[local_resume_path] = page_count
+        return page_count
+
+    def _get_company_match_signal(self, parsed_company: str, profile: dict[str, Any]) -> tuple[str, float]:
+        normalized_company = _normalize_company_name(parsed_company)
+        if not normalized_company:
+            return "not_requested", 0.0
+
+        for employer in profile.get("employer_names", []):
+            if _company_names_equivalent(parsed_company, employer):
+                return "exact_experience_match", STRONG_COMPANY_BOOST
+
+        normalized_text = _normalize_free_text(profile.get("combined_text", ""))
+        if normalized_company and normalized_company in normalized_text:
+            return "loose_mention", WEAK_COMPANY_MENTION_BOOST
+        return "no_match", 0.0
+
+    def _build_candidate_packet(
+        self,
+        result: ResumeResult,
+        profile: dict[str, Any],
+        parsed: ParsedJobDescription,
+    ) -> dict[str, Any]:
+        education_entries = []
+        for entry in profile.get("education_entries", [])[:2]:
+            if isinstance(entry, dict) and entry.get("raw_text"):
+                education_entries.append(str(entry["raw_text"])[:350])
+
+        experience_entries = []
+        for entry in profile.get("experience_entries", [])[:2]:
+            if isinstance(entry, dict) and entry.get("raw_text"):
+                experience_entries.append(str(entry["raw_text"])[:500])
+
+        project_entries = []
+        for entry in profile.get("project_entries", [])[:2]:
+            if isinstance(entry, dict) and entry.get("raw_text"):
+                project_entries.append(str(entry["raw_text"])[:500])
+
+        skills = profile.get("skills", [])
+        if not isinstance(skills, list):
+            skills = [str(skills)]
+
+        return {
+            "candidate_id": result.candidate_id,
+            "candidate_name": result.full_name or result.candidate_id,
+            "major": result.major,
+            "graduation_year": result.graduation_year,
+            "summary": profile.get("summary", ""),
+            "skills": skills[:25],
+            "education": education_entries,
+            "experience": experience_entries,
+            "projects": project_entries,
+            "estimated_years_experience": profile.get("estimated_years_experience"),
+            "company_match_status": result.company_match_status,
+            "page_count": result.page_count,
+            "matched_skills": result.matched_skills,
+            "matched_must_haves": result.hard_filter_status.get("matched_must_have_skills", []),
+            "matched_preferred": result.hard_filter_status.get("matched_preferred_skills", []),
+            "top_evidence_chunks": [
+                {
+                    "section_type": chunk.get("section_type", "other"),
+                    "score": chunk.get("score", 0.0),
+                    "text": str(chunk.get("text", ""))[:350],
+                }
+                for chunk in result.top_evidence_chunks[:2]
+            ],
+            "job_company": parsed.company,
+        }
+
+    def _emit_progress(
+        self,
+        progress_callback: ProgressCallback | None,
+        progress: float,
+        message: str,
+    ) -> None:
+        if callable(progress_callback):
+            progress_callback(max(0.0, min(1.0, progress)), message)
+
+    def _apply_grok_scores(
+        self,
+        query: str,
+        results: list[ResumeResult],
+        parsed: ParsedJobDescription,
+        top_n: int,
+        api_key: str | None = None,
+        final_top_k: int | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[ResumeResult]:
+        if not results:
+            return results
+
+        parsed_requirements = {
+            key: value for key, value in parsed.to_dict().items() if key != "raw_text"
+        }
+        top_n = min(top_n, len(results))
+        page_count_limit = min(len(results), max(top_n, final_top_k or 0))
+        grok_available = has_grok_api_key(api_key)
+
+        for index, result in enumerate(results):
+            if index < page_count_limit:
+                result.page_count = self._get_resume_page_count(result.local_resume_path)
+            if index >= top_n:
+                result.grok_status = "skipped"
+        tasks: list[tuple[ResumeResult, dict[str, Any]]] = []
+        if grok_available:
+            for result in results[:top_n]:
+                profile = self._get_candidate_profile(result.candidate_id)
+                tasks.append((result, self._build_candidate_packet(result, profile, parsed)))
+        else:
+            for result in results[:top_n]:
+                result.grok_status = "unavailable"
+
+        def score_task(task: tuple[ResumeResult, dict[str, Any]]) -> tuple[ResumeResult, dict[str, Any]]:
+            result, candidate_packet = task
+            assessment = assess_candidate_packet_with_grok(
+                job_description=query,
+                parsed_requirements=parsed_requirements,
+                candidate_packet=candidate_packet,
+                api_key=api_key,
+            )
+            return result, assessment
+
+        scored_assessments: list[tuple[ResumeResult, dict[str, Any]]] = []
+        if tasks:
+            max_workers = min(GROK_MAX_WORKERS, len(tasks))
+            if max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {executor.submit(score_task, task): task[0] for task in tasks}
+                    for completed_count, future in enumerate(as_completed(future_map), 1):
+                        scored_assessments.append(future.result())
+                        progress = 0.65 + (0.30 * completed_count / max(len(tasks), 1))
+                        self._emit_progress(
+                            progress_callback,
+                            progress,
+                            f"Evaluating top candidates with Grok ({completed_count}/{len(tasks)})",
+                        )
+            else:
+                for completed_count, task in enumerate(tasks, 1):
+                    scored_assessments.append(score_task(task))
+                    progress = 0.65 + (0.30 * completed_count / max(len(tasks), 1))
+                    self._emit_progress(
+                        progress_callback,
+                        progress,
+                        f"Evaluating top candidates with Grok ({completed_count}/{len(tasks)})",
+                    )
+
+        for result, assessment in scored_assessments:
+            result.grok_status = str(assessment.get("status", "error"))
+            qualification_score = float(assessment.get("qualification_match_score", 0.0))
+            company_score = float(assessment.get("company_relevance_score", 0.0))
+            experience_score = float(assessment.get("experience_relevance_score", 0.0))
+            bullet_score = float(assessment.get("bullet_quality_score", 0.0))
+            project_score = float(assessment.get("project_strength_score", 0.0))
+            resume_score = float(assessment.get("resume_quality_score", 0.0))
+
+            grok_fit_raw = (qualification_score + company_score + experience_score) / 3.0
+            grok_quality_raw = (bullet_score + project_score + resume_score) / 3.0
+
+            result.grok_fit_score = grok_fit_raw / 10.0
+            result.grok_resume_quality_score = grok_quality_raw / 10.0
+            result.grok_summary = str(assessment.get("summary", "")).strip()
+            result.grok_matched_requirements = list(assessment.get("matched_requirements", []))
+            result.grok_missing_requirements = list(assessment.get("missing_requirements", []))
+            result.grok_weakness_flags = list(assessment.get("weakness_flags", []))
+            result.recruiter_score = result.grok_fit_score
+            result.resume_quality_score = result.grok_resume_quality_score
+            result.recruiter_breakdown = {
+                "qualification_match_score": qualification_score,
+                "company_relevance_score": company_score,
+                "experience_relevance_score": experience_score,
+            }
+            result.resume_quality_breakdown = {
+                "bullet_quality_score": bullet_score,
+                "project_strength_score": project_score,
+                "resume_quality_score": resume_score,
+                "status": result.grok_status,
+            }
+
+        for result in results:
+            final_score = self._compute_final_score(result)
+            result.score = final_score
+            result.ranking_details["final_score_components"] = {
+                "retrieval": round(result.retrieval_score, 4),
+                "reranker": round(result.reranker_score, 4),
+                "must_have_coverage": round(result.must_have_coverage, 4),
+                "grok_fit": round(result.grok_fit_score, 4),
+                "grok_quality": round(result.grok_resume_quality_score, 4),
+                "page_penalty": round(FINAL_PAGE_PENALTY if (result.page_count or 0) > 1 else 0.0, 4),
+            }
+            result.ranking_details["grok_status"] = result.grok_status
+            result.ranking_details["company_match_status"] = result.company_match_status
+            result.ranking_details["page_count"] = result.page_count
+        self._emit_progress(progress_callback, 0.97, "Finalizing ranking")
+
+        results.sort(key=lambda item: item.score, reverse=True)
+        for i, result in enumerate(results, 1):
+            result.rank = i
+        return results
+
+    def _compute_final_score(self, result: ResumeResult) -> float:
+        page_penalty = FINAL_PAGE_PENALTY if (result.page_count or 0) > 1 else 0.0
+        final_score = (
+            (0.30 * float(result.retrieval_score))
+            + (0.20 * float(result.reranker_score))
+            + (0.15 * float(result.must_have_coverage))
+            + (0.20 * float(result.grok_fit_score))
+            + (0.15 * float(result.grok_resume_quality_score))
+            - page_penalty
+        )
+        return max(0.001, min(0.999, final_score))
 
     def _retrieve_chunks(self, query: str, parsed: ParsedJobDescription, top_k: int) -> list[ChunkHit]:
         if self.retrieval_backend == "semantic-chunk" and self.index is not None and self.model is not None and self.chunk_metadata:
@@ -664,15 +990,8 @@ class SearchEngine:
             if parsed.preferred_skills:
                 preferred_ratio = preferred_count / max(len(parsed.preferred_skills), 1)
 
-            # Company Match Boost
-            company_boost = 0.0
-            if parsed.company:
-                if parsed.company.lower() in profile.get("combined_text", "").lower():
-                    company_boost = 0.25 
-                elif parsed.company.lower() in candidate_id.lower():
-                    company_boost = 0.15
+            company_match_status, company_boost = self._get_company_match_signal(parsed.company, profile)
 
-            # Adjusted weights: More emphasis on best chunk, must-have matches, and company context
             combined_score = min(
                 1.0,
                 (0.55 * best_score)
@@ -719,16 +1038,22 @@ class SearchEngine:
                     matched_skills=matched_skills,
                     top_evidence_chunks=top_evidence,
                     hard_filter_status=filter_status,
+                    retrieval_score=combined_score,
+                    must_have_coverage=must_have_ratio,
+                    company_match_status=company_match_status,
                     ranking_details={
                         "mode": "job_description_retrieval",
                         "retrieval_backend": self.retrieval_backend,
                         "base_search_score": round(best_score, 4),
+                        "retrieval_score": round(combined_score, 4),
                         "mean_top_chunk_score": round(mean_top_scores, 4),
                         "evidence_chunk_count": len(hits),
                         "matched_must_have_count": must_have_count,
                         "total_must_have_count": len(parsed.must_have_skills),
                         "matched_preferred_count": preferred_count,
                         "total_preferred_count": len(parsed.preferred_skills),
+                        "company_match_status": company_match_status,
+                        "company_boost": round(company_boost, 4),
                     },
                 )
             )
@@ -819,6 +1144,10 @@ class SearchEngine:
         parsed = self.parsed_resume_map.get(candidate_id, {})
         meta = self.resume_metadata_by_filename.get(candidate_id, {})
         metadata = parsed.get("metadata", {}) if isinstance(parsed.get("metadata"), dict) else {}
+        experience_entries = parsed.get("experience", [])
+        education_entries = parsed.get("education", [])
+        project_entries = parsed.get("projects", [])
+        summary = parsed.get("summary", "")
         text_parts = []
         if meta.get("text"):
             text_parts.append(meta["text"])
@@ -847,10 +1176,15 @@ class SearchEngine:
             "linkedin": metadata.get("linkedin", meta.get("linkedin", "")),
             "github": metadata.get("github", meta.get("github", "")),
             "skills": parsed.get("skills", []),
-            "education": parsed.get("education", []),
+            "summary": "\n".join(summary) if isinstance(summary, list) else str(summary or ""),
+            "education": education_entries,
+            "education_entries": education_entries,
+            "experience_entries": experience_entries,
+            "project_entries": project_entries,
+            "employer_names": _extract_employer_names(experience_entries),
             "location_text": (meta.get("text", "")[:300] if meta.get("text") else ""),
             "combined_text": "\n".join(part for part in text_parts if part),
-            "estimated_years_experience": self._estimate_years_experience(parsed.get("experience", [])),
+            "estimated_years_experience": self._estimate_years_experience(experience_entries),
         }
         return profile
 
@@ -1051,6 +1385,7 @@ class SearchEngine:
                     major=meta.get("major", ""),
                     graduation_year=meta.get("graduation_year", ""),
                     matched_skills=matched,
+                    retrieval_score=score,
                     ranking_details={"mode": "demo_search", "base_search_score": round(score, 4)},
                 )
             )
