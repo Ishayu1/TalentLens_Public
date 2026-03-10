@@ -39,9 +39,10 @@ MEMBER_RESUMES_META_PATH = PROJECT_ROOT / "member_resumes_metadata.json"
 FAISS_INDEX_PATH = PROJECT_ROOT / "resume_index.faiss"
 MEMBER_SOURCES = {"ds3_members", "ds3_board"}
 DEFAULT_MEMBER_SOURCE = "ds3_members"
-PARSER_VERSION = "ds3_parser_v1"
+PARSER_VERSION = "ds3_parser_v2"
 DEFAULT_GROK_MODE = "auto"
 DEFAULT_GROK_WORKERS = 4
+ENTRY_REPAIR_CONFIDENCE_THRESHOLD = 0.75
 GROK_NON_REASONING_MODELS = [
     "grok-4-fast-non-reasoning",
     "grok-4-1-fast-non-reasoning",
@@ -91,6 +92,23 @@ BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+•·▪◦]|[A-Za-z]\)|\d+\.)\s*")
 TITLE_HINT_RE = re.compile(
     r"(?i)\b(intern|engineer|developer|analyst|assistant|researcher|lead|manager|president|founder|tutor|designer|consultant|scientist|chair|coordinator|officer)\b"
 )
+TITLE_LOCATION_PREFIXES = {
+    "intern",
+    "engineer",
+    "engineering",
+    "developer",
+    "analyst",
+    "assistant",
+    "researcher",
+    "manager",
+    "president",
+    "founder",
+    "designer",
+    "consultant",
+    "scientist",
+    "coordinator",
+    "officer",
+}
 ACTION_VERB_RE = re.compile(
     r"(?i)^(?:built|developed|engineered|designed|implemented|led|created|launched|deployed|improved|optimized|"
     r"analyzed|conducted|supported|trained|managed|delivered|reduced|increased|automated|contributed|researched|"
@@ -111,6 +129,27 @@ COMPANY_SUFFIXES = {
 }
 DIRTY_SKILL_RE = re.compile(r":|/|\b(?:node js|next_js|sckit|scikit learn|frameworks|libraries)\b", re.I)
 SECTION_STOPWORDS = {"skills", "interests", "experience", "projects", "education", "summary", "contact"}
+ROLE_PHRASE_HINTS = {
+    "software",
+    "engineering",
+    "engineer",
+    "developer",
+    "research",
+    "science",
+    "scientist",
+    "machine",
+    "learning",
+    "analyst",
+    "intern",
+    "assistant",
+    "manager",
+    "product",
+    "frontend",
+    "backend",
+    "fullstack",
+    "platform",
+    "vision",
+}
 EXTRA_TECH_ALIASES = {
     "Node.js": ("node js", "node.js", "nodejs"),
     "Next.js": ("next js", "next.js", "nextjs", "next_js"),
@@ -164,6 +203,8 @@ _TECH_PATTERNS: dict[str, list[re.Pattern]] = {}
 @dataclass
 class RebuildStats:
     total_ds3: int = 0
+    entry_grok_candidates: int = 0
+    entry_grok_repaired: int = 0
     grok_candidates: int = 0
     grok_enriched: int = 0
 
@@ -387,8 +428,29 @@ def _extract_location(lines: list[str]) -> str:
     for line in lines:
         match = LOCATION_SUFFIX_RE.search(line.strip())
         if match:
-            return match.group(0).strip()
+            candidate = match.group(0).strip()
+            normalized = _normalize_location_candidate(candidate)
+            if normalized:
+                return normalized
     return ""
+
+
+def _normalize_location_candidate(location: str) -> str:
+    if not location:
+        return ""
+    value = location.strip(" -,|")
+    if not value:
+        return ""
+    if value.lower() in {"remote", "hybrid", "on-site", "onsite"}:
+        return value
+    if "," not in value:
+        return value
+
+    city_part, state_part = [part.strip() for part in value.rsplit(",", 1)]
+    city_words = city_part.split()
+    if len(city_words) >= 2 and city_words[0].lower() in TITLE_LOCATION_PREFIXES:
+        city_part = " ".join(city_words[1:]).strip()
+    return f"{city_part}, {state_part}".strip(" ,")
 
 
 def _is_title_like(text: str) -> bool:
@@ -401,7 +463,14 @@ def _parse_header_fields(header_lines: list[str]) -> tuple[str, str, list[str], 
         dates.extend(match.group(0) for match in DATE_FRAGMENT_RE.finditer(line))
     cleaned_headers = [_remove_dates(line) for line in header_lines if _remove_dates(line)]
     location = _extract_location(cleaned_headers)
-    stripped_headers = [LOCATION_SUFFIX_RE.sub("", line).strip(" -,|") for line in cleaned_headers if line]
+    stripped_headers: list[str] = []
+    for line in cleaned_headers:
+        stripped_line = line
+        if location and stripped_line.endswith(location):
+            stripped_line = stripped_line[: -len(location)]
+        else:
+            stripped_line = LOCATION_SUFFIX_RE.sub("", stripped_line)
+        stripped_headers.append(stripped_line.strip(" -,|"))
     header_parts: list[str] = []
     for line in stripped_headers:
         if "|" in line or "//" in line:
@@ -457,17 +526,20 @@ def _parse_experience_entries(section_text: str) -> list[dict]:
                 if _normalize_company_name(tech) != normalized_company
             ]
         entries.append(
-            {
-                "title": title,
-                "company": company,
-                "company_normalized": normalized_company,
-                "dates": dates,
-                "location": location,
-                "bullets": bullets,
-                "technologies": technologies,
-                "raw_header": " | ".join(header_lines).strip(),
-                "raw_text": raw_text,
-            }
+            _annotate_entry_metadata(
+                {
+                    "title": title,
+                    "company": company,
+                    "company_normalized": normalized_company,
+                    "dates": dates,
+                    "location": location,
+                    "bullets": bullets,
+                    "technologies": technologies,
+                    "raw_header": " | ".join(header_lines).strip(),
+                    "raw_text": raw_text,
+                },
+                "experience",
+            )
         )
     return entries
 
@@ -510,17 +582,161 @@ def _parse_project_entries(section_text: str) -> list[dict]:
         bullets = _merge_bullet_lines(body_lines)
         technologies = _extract_technologies("\n".join(header_lines + bullets))
         entries.append(
-            {
-                "name": name,
-                "dates": dates,
-                "location": location,
-                "bullets": bullets,
-                "technologies": technologies,
-                "raw_header": " | ".join(header_lines).strip(),
-                "raw_text": "\n".join(block).strip(),
-            }
+            _annotate_entry_metadata(
+                {
+                    "name": name,
+                    "dates": dates,
+                    "location": location,
+                    "bullets": bullets,
+                    "technologies": technologies,
+                    "raw_header": " | ".join(header_lines).strip(),
+                    "raw_text": "\n".join(block).strip(),
+                },
+                "projects",
+            )
         )
     return entries
+
+
+def _entry_header_lines(entry: dict) -> list[str]:
+    raw_text = str(entry.get("raw_text", "")).strip()
+    header_lines: list[str] = []
+    if raw_text:
+        for line in _clean_resume_text(raw_text).splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _is_bullet_line(stripped):
+                break
+            header_lines.append(stripped)
+            if len(header_lines) >= 2:
+                break
+    if not header_lines:
+        raw_header = str(entry.get("raw_header", "")).strip()
+        if raw_header:
+            header_lines = [part.strip() for part in raw_header.split("|") if part.strip()][:2]
+    return header_lines
+
+
+def _looks_like_role_phrase(text: str) -> bool:
+    normalized = _normalize_company_name(text)
+    if not normalized:
+        return False
+    if _is_title_like(text):
+        return True
+    return any(token in ROLE_PHRASE_HINTS for token in normalized.split())
+
+
+def _is_generic_company_label(text: str) -> bool:
+    normalized = _normalize_company_name(text)
+    if not normalized:
+        return False
+    tokens = normalized.split()
+    if len(tokens) > 5:
+        return False
+    if normalized in {"software engineering", "data science", "machine learning", "computer vision"}:
+        return True
+    return _looks_like_role_phrase(text) and not any(
+        token in {"lab", "institute", "group", "technologies", "systems", "society", "university"}
+        for token in tokens
+    )
+
+
+def _score_from_warnings(base: float, warnings: list[str]) -> float:
+    penalties = {
+        "missing_title": 0.25,
+        "missing_company": 0.28,
+        "missing_company_normalized": 0.18,
+        "missing_project_name": 0.28,
+        "company_looks_like_title": 0.35,
+        "title_company_inversion": 0.35,
+        "company_then_title_layout": 0.20,
+        "sparse_structured_parse": 0.18,
+        "title_like_location": 0.30,
+        "project_name_too_generic": 0.20,
+        "project_header_sparse": 0.18,
+    }
+    score = base
+    for warning in warnings:
+        score -= penalties.get(warning, 0.08)
+    return round(max(0.05, min(0.99, score)), 2)
+
+
+def _experience_entry_warnings(entry: dict) -> list[str]:
+    warnings: list[str] = []
+    title = str(entry.get("title", "")).strip()
+    company = str(entry.get("company", "")).strip()
+    company_normalized = str(entry.get("company_normalized", "")).strip()
+    location = str(entry.get("location", "")).strip()
+    header_lines = _entry_header_lines(entry)
+    cleaned_header_lines = [_remove_dates(line) for line in header_lines if _remove_dates(line)]
+
+    if not title:
+        warnings.append("missing_title")
+    if not company:
+        warnings.append("missing_company")
+    elif _is_generic_company_label(company):
+        warnings.append("company_looks_like_title")
+    if company and title and not _looks_like_role_phrase(title) and _looks_like_role_phrase(company):
+        warnings.append("title_company_inversion")
+    if not company_normalized:
+        warnings.append("missing_company_normalized")
+    if location:
+        first_word = location.split()[0].strip(",").lower()
+        if first_word in TITLE_LOCATION_PREFIXES:
+            warnings.append("title_like_location")
+    if len(cleaned_header_lines) >= 2:
+        first, second = cleaned_header_lines[0], cleaned_header_lines[1]
+        if first and second and not _looks_like_role_phrase(first) and _looks_like_role_phrase(second):
+            warnings.append("company_then_title_layout")
+    raw_header = str(entry.get("raw_header", "")).strip()
+    if raw_header and ("|" in raw_header or len(header_lines) >= 2) and (not title or not company):
+        warnings.append("sparse_structured_parse")
+    return sorted(set(warnings))
+
+
+def _project_entry_warnings(entry: dict) -> list[str]:
+    warnings: list[str] = []
+    name = str(entry.get("name", "")).strip()
+    raw_header = str(entry.get("raw_header", "")).strip()
+    location = str(entry.get("location", "")).strip()
+
+    if not name:
+        warnings.append("missing_project_name")
+    elif len(name.split()) <= 2 and name.lower() in {"project", "projects", "research", "application"}:
+        warnings.append("project_name_too_generic")
+    if raw_header and ("|" in raw_header or _line_has_date(raw_header)) and not name:
+        warnings.append("project_header_sparse")
+    if location:
+        first_word = location.split()[0].strip(",").lower()
+        if first_word in TITLE_LOCATION_PREFIXES:
+            warnings.append("title_like_location")
+    return sorted(set(warnings))
+
+
+def _annotate_entry_metadata(
+    entry: dict,
+    section_type: str,
+    repair_source: str = "deterministic",
+    suppress_warnings: set[str] | None = None,
+) -> dict:
+    annotated = deepcopy(entry)
+    if section_type == "experience":
+        warnings = _experience_entry_warnings(annotated)
+        base_confidence = 0.9 if repair_source == "deterministic" else 0.95
+    else:
+        warnings = _project_entry_warnings(annotated)
+        base_confidence = 0.92 if repair_source == "deterministic" else 0.96
+    if suppress_warnings:
+        warnings = [warning for warning in warnings if warning not in suppress_warnings]
+    annotated["entry_parse_warnings"] = warnings
+    annotated["entry_parse_confidence"] = _score_from_warnings(base_confidence, warnings)
+    annotated["repair_source"] = repair_source
+    return annotated
+
+
+def _entry_needs_grok_repair(entry: dict) -> bool:
+    return bool(entry.get("entry_parse_warnings")) and float(entry.get("entry_parse_confidence", 0.0)) < ENTRY_REPAIR_CONFIDENCE_THRESHOLD
 
 
 def _parse_education_entries(section_text: str) -> list[dict]:
@@ -565,6 +781,13 @@ def _compute_parse_confidence(parsed: dict) -> float:
         score += 0.15
     if all(entry.get("company_normalized") for entry in parsed.get("experience", [])):
         score += 0.15
+    entry_confidences = [
+        float(entry.get("entry_parse_confidence", 0.0))
+        for entry in parsed.get("experience", []) + parsed.get("projects", [])
+        if isinstance(entry, dict)
+    ]
+    if entry_confidences:
+        score += 0.10 * min(1.0, sum(entry_confidences) / len(entry_confidences))
     return round(min(score, 0.95), 2)
 
 
@@ -582,6 +805,8 @@ def _should_enrich_with_grok(parsed: dict) -> tuple[bool, list[str]]:
         reasons.append("undersplit_projects")
     if any(not entry.get("company_normalized") for entry in experience):
         reasons.append("missing_company")
+    if any(_entry_needs_grok_repair(entry) for entry in experience + projects if isinstance(entry, dict)):
+        reasons.append("ambiguous_entries")
     if parsed.get("parse_warnings"):
         reasons.append("parse_warnings_present")
     return bool(reasons), reasons
@@ -647,6 +872,135 @@ def _call_non_reasoning_grok(prompt: str) -> dict:
     raise RuntimeError(f"Grok enrichment failed: {last_error}")
 
 
+def _grok_entry_prompt(candidate_id: str, section_type: str, entry: dict) -> str:
+    header_lines = _entry_header_lines(entry)
+    prompt_payload = {
+        "candidate_id": candidate_id,
+        "section_type": section_type,
+        "raw_header_lines": header_lines,
+        "raw_header": entry.get("raw_header", ""),
+        "raw_text": entry.get("raw_text", "")[:2500],
+        "deterministic_parse": entry,
+    }
+    if section_type == "experience":
+        expected_keys = (
+            "{\"title\": string, \"company\": string, \"company_normalized\": string, "
+            "\"dates\": string[], \"location\": string, \"bullets\": string[], "
+            "\"technologies\": string[], \"confidence\": number, \"reason\": string}"
+        )
+    else:
+        expected_keys = (
+            "{\"name\": string, \"dates\": string[], \"location\": string, "
+            "\"bullets\": string[], \"technologies\": string[], "
+            "\"confidence\": number, \"reason\": string}"
+        )
+    return (
+        f"Repair this single {section_type} entry from a DS3 resume. Use only the provided text. "
+        "Do not hallucinate missing facts. Prefer empty strings or empty arrays when uncertain. "
+        f"Return strict JSON only with this exact shape: {expected_keys}\n\n"
+        "Rules:\n"
+        "- fix title/company inversions when header layout is ambiguous\n"
+        "- keep dates and location grounded in the header text\n"
+        "- preserve bullets unless the provided raw text clearly supports a cleaner equivalent\n"
+        "- technologies must be canonical names when they are explicitly supported\n\n"
+        f"Input:\n{json.dumps(prompt_payload, ensure_ascii=False)}"
+    )
+
+
+def _merge_grok_entry_repair(entry: dict, payload: dict, section_type: str) -> dict:
+    merged = deepcopy(entry)
+    original_bullets = _coerce_string_list(entry.get("bullets"))
+    payload_bullets = _coerce_string_list(payload.get("bullets"))
+    bullets = original_bullets or payload_bullets
+
+    if section_type == "experience":
+        title = str(payload.get("title", "")).strip() or str(entry.get("title", "")).strip()
+        company = str(payload.get("company", "")).strip() or str(entry.get("company", "")).strip()
+        merged.update(
+            {
+                "title": title,
+                "company": company,
+                "company_normalized": (
+                    str(payload.get("company_normalized", "")).strip()
+                    or _normalize_company_name(company)
+                    or str(entry.get("company_normalized", "")).strip()
+                ),
+                "dates": _coerce_string_list(payload.get("dates")) or _coerce_string_list(entry.get("dates")),
+                "location": str(payload.get("location", "")).strip() or str(entry.get("location", "")).strip(),
+                "bullets": bullets,
+            }
+        )
+        technology_text = "\n".join(
+            [
+                str(merged.get("title", "")).strip(),
+                str(merged.get("company", "")).strip(),
+                str(merged.get("raw_header", "")).strip(),
+                "\n".join(bullets),
+                " ".join(_coerce_string_list(payload.get("technologies"))),
+            ]
+        )
+        merged["technologies"] = sorted(
+            set(
+                _coerce_string_list(entry.get("technologies"))
+                + _coerce_string_list(payload.get("technologies"))
+                + _extract_technologies(technology_text)
+            )
+        )
+        merged = _annotate_entry_metadata(
+            merged,
+            "experience",
+            repair_source="grok_entry_repair",
+            suppress_warnings={"company_then_title_layout", "company_looks_like_title", "title_company_inversion", "sparse_structured_parse"},
+        )
+    else:
+        name = str(payload.get("name", "")).strip() or str(entry.get("name", "")).strip()
+        merged.update(
+            {
+                "name": name,
+                "dates": _coerce_string_list(payload.get("dates")) or _coerce_string_list(entry.get("dates")),
+                "location": str(payload.get("location", "")).strip() or str(entry.get("location", "")).strip(),
+                "bullets": bullets,
+            }
+        )
+        technology_text = "\n".join(
+            [
+                str(merged.get("name", "")).strip(),
+                str(merged.get("raw_header", "")).strip(),
+                "\n".join(bullets),
+                " ".join(_coerce_string_list(payload.get("technologies"))),
+            ]
+        )
+        merged["technologies"] = sorted(
+            set(
+                _coerce_string_list(entry.get("technologies"))
+                + _coerce_string_list(payload.get("technologies"))
+                + _extract_technologies(technology_text)
+            )
+        )
+        merged = _annotate_entry_metadata(
+            merged,
+            "projects",
+            repair_source="grok_entry_repair",
+            suppress_warnings={"project_header_sparse", "project_name_too_generic"},
+        )
+
+    try:
+        payload_confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        payload_confidence = 0.0
+    if payload_confidence > 0:
+        merged["entry_parse_confidence"] = round(
+            max(float(merged.get("entry_parse_confidence", 0.0)), min(payload_confidence, 0.99)),
+            2,
+        )
+    reason = str(payload.get("reason", "")).strip()
+    if reason:
+        warnings = list(merged.get("entry_parse_warnings", []))
+        warnings.append(f"grok_entry_repair_reason:{reason}")
+        merged["entry_parse_warnings"] = sorted(set(warnings))
+    return merged
+
+
 def _grok_prompt(extracted_record: dict, parsed: dict, reasons: list[str]) -> str:
     payload = {
         "candidate_id": parsed.get("candidate_id"),
@@ -694,47 +1048,55 @@ def _merge_grok_enrichment(parsed: dict, payload: dict) -> dict:
     experience_entries = payload.get("experience_entries")
     if isinstance(experience_entries, list) and experience_entries:
         enriched["experience"] = [
-            {
-                "title": str(entry.get("title", "")).strip(),
-                "company": str(entry.get("company", "")).strip(),
-                "company_normalized": str(entry.get("company_normalized", "")).strip() or _normalize_company_name(str(entry.get("company", ""))),
-                "dates": _coerce_string_list(entry.get("dates")),
-                "location": str(entry.get("location", "")).strip(),
-                "bullets": _coerce_string_list(entry.get("bullets")),
-                "technologies": sorted(
-                    set(
-                        _extract_technologies(" ".join(_coerce_string_list(entry.get("technologies"))))
-                        + _coerce_string_list(entry.get("technologies"))
-                    )
-                ),
-                "raw_header": str(entry.get("title", "")).strip(),
-                "raw_text": "\n".join(
-                    [str(entry.get("title", "")).strip(), str(entry.get("company", "")).strip()]
-                    + _coerce_string_list(entry.get("bullets"))
-                ).strip(),
-            }
+            _annotate_entry_metadata(
+                {
+                    "title": str(entry.get("title", "")).strip(),
+                    "company": str(entry.get("company", "")).strip(),
+                    "company_normalized": str(entry.get("company_normalized", "")).strip() or _normalize_company_name(str(entry.get("company", ""))),
+                    "dates": _coerce_string_list(entry.get("dates")),
+                    "location": str(entry.get("location", "")).strip(),
+                    "bullets": _coerce_string_list(entry.get("bullets")),
+                    "technologies": sorted(
+                        set(
+                            _extract_technologies(" ".join(_coerce_string_list(entry.get("technologies"))))
+                            + _coerce_string_list(entry.get("technologies"))
+                        )
+                    ),
+                    "raw_header": str(entry.get("title", "")).strip(),
+                    "raw_text": "\n".join(
+                        [str(entry.get("title", "")).strip(), str(entry.get("company", "")).strip()]
+                        + _coerce_string_list(entry.get("bullets"))
+                    ).strip(),
+                },
+                "experience",
+                repair_source="grok_resume_enrichment",
+            )
             for entry in experience_entries
             if isinstance(entry, dict)
         ]
     project_entries = payload.get("project_entries")
     if isinstance(project_entries, list) and project_entries:
         enriched["projects"] = [
-            {
-                "name": str(entry.get("name", "")).strip(),
-                "dates": _coerce_string_list(entry.get("dates")),
-                "location": str(entry.get("location", "")).strip(),
-                "bullets": _coerce_string_list(entry.get("bullets")),
-                "technologies": sorted(
-                    set(
-                        _extract_technologies(" ".join(_coerce_string_list(entry.get("technologies"))))
-                        + _coerce_string_list(entry.get("technologies"))
-                    )
-                ),
-                "raw_header": str(entry.get("name", "")).strip(),
-                "raw_text": "\n".join(
-                    [str(entry.get("name", "")).strip()] + _coerce_string_list(entry.get("bullets"))
-                ).strip(),
-            }
+            _annotate_entry_metadata(
+                {
+                    "name": str(entry.get("name", "")).strip(),
+                    "dates": _coerce_string_list(entry.get("dates")),
+                    "location": str(entry.get("location", "")).strip(),
+                    "bullets": _coerce_string_list(entry.get("bullets")),
+                    "technologies": sorted(
+                        set(
+                            _extract_technologies(" ".join(_coerce_string_list(entry.get("technologies"))))
+                            + _coerce_string_list(entry.get("technologies"))
+                        )
+                    ),
+                    "raw_header": str(entry.get("name", "")).strip(),
+                    "raw_text": "\n".join(
+                        [str(entry.get("name", "")).strip()] + _coerce_string_list(entry.get("bullets"))
+                    ).strip(),
+                },
+                "projects",
+                repair_source="grok_resume_enrichment",
+            )
             for entry in project_entries
             if isinstance(entry, dict)
         ]
@@ -948,6 +1310,63 @@ def _encode_and_index_chunks(chunks: list[dict]) -> None:
     faiss.write_index(index, str(FAISS_INDEX_PATH))
 
 
+def _repair_ambiguous_entries_with_grok(
+    extracted_by_id: dict[str, dict],
+    parsed_by_id: dict[str, dict],
+    use_grok: str,
+    grok_workers: int,
+) -> tuple[dict[str, dict], RebuildStats]:
+    stats = RebuildStats(total_ds3=len(parsed_by_id))
+    if use_grok == "never":
+        return parsed_by_id, stats
+
+    api_key = _grok_api_key()
+    if use_grok == "always" and not api_key:
+        raise RuntimeError("XAI_API_KEY is required when --use-grok=always")
+    if use_grok == "auto" and not api_key:
+        return parsed_by_id, stats
+
+    tasks: list[tuple[str, str, int, dict]] = []
+    for candidate_id, parsed in parsed_by_id.items():
+        for section_type, entries_key in (("experience", "experience"), ("projects", "projects")):
+            entries = parsed.get(entries_key, [])
+            for index, entry in enumerate(entries):
+                if isinstance(entry, dict) and _entry_needs_grok_repair(entry):
+                    stats.entry_grok_candidates += 1
+                    tasks.append((candidate_id, section_type, index, entry))
+
+    def run_task(task: tuple[str, str, int, dict]) -> tuple[str, str, int, dict]:
+        candidate_id, section_type, index, entry = task
+        try:
+            payload = _call_non_reasoning_grok(_grok_entry_prompt(candidate_id, section_type, entry))
+            repaired = _merge_grok_entry_repair(entry, payload, section_type)
+            return candidate_id, section_type, index, repaired
+        except Exception as exc:
+            fallback = deepcopy(entry)
+            warnings = list(fallback.get("entry_parse_warnings", []))
+            warnings.append(f"grok_entry_repair_failed:{exc.__class__.__name__}")
+            fallback["entry_parse_warnings"] = sorted(set(warnings))
+            return candidate_id, section_type, index, fallback
+
+    if not tasks:
+        return parsed_by_id, stats
+
+    with ThreadPoolExecutor(max_workers=max(1, grok_workers)) as executor:
+        future_map = {executor.submit(run_task, task): task for task in tasks}
+        with tqdm(total=len(future_map), desc="Grok entry repair", unit="entry") as progress:
+            for future in as_completed(future_map):
+                candidate_id, section_type, index, repaired = future.result()
+                entries_key = "experience" if section_type == "experience" else "projects"
+                parsed_by_id[candidate_id][entries_key][index] = repaired
+                if repaired.get("repair_source") == "grok_entry_repair":
+                    stats.entry_grok_repaired += 1
+                progress.update(1)
+
+    for parsed in parsed_by_id.values():
+        parsed["parse_confidence"] = _compute_parse_confidence(parsed)
+    return parsed_by_id, stats
+
+
 def _enrich_ds3_records(
     extracted_by_id: dict[str, dict],
     parsed_by_id: dict[str, dict],
@@ -1016,7 +1435,15 @@ def rebuild_ds3_artifacts(use_grok: str = DEFAULT_GROK_MODE, grok_workers: int =
         unit="resume",
     ):
         parsed_by_id[record_id] = _deterministic_parse(record)
+    parsed_by_id, entry_stats = _repair_ambiguous_entries_with_grok(
+        extracted_by_id,
+        parsed_by_id,
+        use_grok=use_grok,
+        grok_workers=grok_workers,
+    )
     parsed_by_id, stats = _enrich_ds3_records(extracted_by_id, parsed_by_id, use_grok=use_grok, grok_workers=grok_workers)
+    stats.entry_grok_candidates = entry_stats.entry_grok_candidates
+    stats.entry_grok_repaired = entry_stats.entry_grok_repaired
 
     ds3_parsed_rows = [parsed_by_id[record_id] for record_id in extracted_by_id]
     ds3_chunks: list[dict] = []
@@ -1059,6 +1486,8 @@ def main() -> None:
                 "status": "ok",
                 "parser_version": PARSER_VERSION,
                 "total_ds3": stats.total_ds3,
+                "entry_grok_candidates": stats.entry_grok_candidates,
+                "entry_grok_repaired": stats.entry_grok_repaired,
                 "grok_candidates": stats.grok_candidates,
                 "grok_enriched": stats.grok_enriched,
                 "parsed_path": str(PARSED_PATH),

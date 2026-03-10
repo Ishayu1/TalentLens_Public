@@ -114,6 +114,46 @@ Campus Navigation App | React Native, Firebase | Sep 2024 - Dec 2024
         self.assertEqual(ds3_rebuild._normalize_company_name("Northrop Grumman Corp."), "northrop grumman")
         self.assertEqual(ds3_rebuild._normalize_company_name("Northrop Grumman Corporation"), "northrop grumman")
 
+    def test_header_parser_handles_company_then_title_layout(self):
+        title, company, dates, location = ds3_rebuild._parse_header_fields(
+            [
+                "Rivian June 2025 September 2025",
+                "Software Engineering Intern Irvine, CA",
+            ]
+        )
+
+        self.assertEqual(title, "Software Engineering Intern")
+        self.assertEqual(company, "Rivian")
+        self.assertEqual(dates, ["June 2025", "September 2025"])
+        self.assertEqual(location, "Irvine, CA")
+
+    def test_ambiguous_experience_entry_is_flagged_for_entry_repair(self):
+        entries = ds3_rebuild._parse_experience_entries(
+            """
+Rivian June 2025 September 2025
+Software Engineering Intern Irvine, CA
+- Built Databricks pipelines for vehicle telemetry.
+"""
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertIn("company_then_title_layout", entries[0]["entry_parse_warnings"])
+        self.assertLess(entries[0]["entry_parse_confidence"], ds3_rebuild.ENTRY_REPAIR_CONFIDENCE_THRESHOLD)
+        self.assertTrue(ds3_rebuild._entry_needs_grok_repair(entries[0]))
+
+    def test_well_structured_experience_entry_skips_entry_repair(self):
+        entries = ds3_rebuild._parse_experience_entries(
+            """
+Software Engineering Intern | Amazon | Seattle, WA | Jun 2024 - Sep 2024
+- Built internal tooling in Java and React.
+"""
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["entry_parse_warnings"], [])
+        self.assertGreaterEqual(entries[0]["entry_parse_confidence"], ds3_rebuild.ENTRY_REPAIR_CONFIDENCE_THRESHOLD)
+        self.assertFalse(ds3_rebuild._entry_needs_grok_repair(entries[0]))
+
     def test_grok_enrichment_gating_skips_strong_parse_and_flags_weak_parse(self):
         strong = {
             "canonical_skills": ["Python", "AWS", "FastAPI", "PostgreSQL", "Docker"],
@@ -146,6 +186,159 @@ Campus Navigation App | React Native, Firebase | Sep 2024 - Dec 2024
         self.assertIn("undersplit_experience", reasons_weak)
         self.assertIn("undersplit_projects", reasons_weak)
         self.assertIn("missing_company", reasons_weak)
+
+    def test_merge_grok_entry_repair_updates_experience_fields(self):
+        entry = {
+            "title": "Rivian",
+            "company": "Software Engineering",
+            "company_normalized": "software engineering",
+            "dates": ["June 2025", "September 2025"],
+            "location": "Intern Irvine, CA",
+            "bullets": ["Built Databricks pipelines for vehicle telemetry."],
+            "technologies": ["Spark"],
+            "raw_header": "Rivian June 2025 September 2025 | Software Engineering Intern Irvine, CA",
+            "raw_text": "Rivian June 2025 September 2025\nSoftware Engineering Intern Irvine, CA\nBuilt Databricks pipelines for vehicle telemetry.",
+            "entry_parse_warnings": ["title_company_inversion", "title_like_location"],
+            "entry_parse_confidence": 0.32,
+            "repair_source": "deterministic",
+        }
+        payload = {
+            "title": "Software Engineering Intern",
+            "company": "Rivian",
+            "company_normalized": "rivian",
+            "dates": ["June 2025", "September 2025"],
+            "location": "Irvine, CA",
+            "bullets": ["Built Databricks pipelines for vehicle telemetry."],
+            "technologies": ["Databricks", "Spark"],
+            "confidence": 0.93,
+            "reason": "First header line is employer and second line is role plus location.",
+        }
+
+        repaired = ds3_rebuild._merge_grok_entry_repair(entry, payload, "experience")
+
+        self.assertEqual(repaired["title"], "Software Engineering Intern")
+        self.assertEqual(repaired["company"], "Rivian")
+        self.assertEqual(repaired["company_normalized"], "rivian")
+        self.assertEqual(repaired["location"], "Irvine, CA")
+        self.assertEqual(repaired["repair_source"], "grok_entry_repair")
+        self.assertGreaterEqual(repaired["entry_parse_confidence"], 0.93)
+        self.assertIn("Databricks", repaired["technologies"])
+        self.assertNotIn("title_company_inversion", repaired["entry_parse_warnings"])
+
+    def test_merge_grok_entry_repair_updates_project_fields(self):
+        entry = {
+            "name": "Project",
+            "dates": ["Jan 2025", "Mar 2025"],
+            "location": "",
+            "bullets": ["Built an analytics dashboard."],
+            "technologies": ["Python"],
+            "raw_header": "Campus Dashboard | Python, Streamlit | Jan 2025 - Mar 2025",
+            "raw_text": "Campus Dashboard | Python, Streamlit | Jan 2025 - Mar 2025\nBuilt an analytics dashboard.",
+            "entry_parse_warnings": ["project_name_too_generic"],
+            "entry_parse_confidence": 0.54,
+            "repair_source": "deterministic",
+        }
+        payload = {
+            "name": "Campus Dashboard",
+            "dates": ["Jan 2025", "Mar 2025"],
+            "location": "",
+            "bullets": ["Built an analytics dashboard."],
+            "technologies": ["Python", "Streamlit"],
+            "confidence": 0.9,
+            "reason": "Header clearly identifies the project name before the technology list.",
+        }
+
+        repaired = ds3_rebuild._merge_grok_entry_repair(entry, payload, "projects")
+
+        self.assertEqual(repaired["name"], "Campus Dashboard")
+        self.assertEqual(repaired["repair_source"], "grok_entry_repair")
+        self.assertGreaterEqual(repaired["entry_parse_confidence"], 0.9)
+        self.assertIn("Streamlit", repaired["technologies"])
+        self.assertNotIn("project_name_too_generic", repaired["entry_parse_warnings"])
+
+    def test_entry_repair_fallback_keeps_entry_and_adds_warning(self):
+        parsed_by_id = {
+            "cand.pdf": {
+                "candidate_id": "cand.pdf",
+                "experience": [
+                    {
+                        "title": "Rivian",
+                        "company": "Software Engineering",
+                        "company_normalized": "software engineering",
+                        "dates": ["June 2025", "September 2025"],
+                        "location": "Intern Irvine, CA",
+                        "bullets": ["Built Databricks pipelines."],
+                        "technologies": ["Spark"],
+                        "raw_header": "Rivian June 2025 September 2025 | Software Engineering Intern Irvine, CA",
+                        "raw_text": "Rivian June 2025 September 2025\nSoftware Engineering Intern Irvine, CA\nBuilt Databricks pipelines.",
+                        "entry_parse_warnings": ["title_company_inversion", "company_then_title_layout"],
+                        "entry_parse_confidence": 0.31,
+                        "repair_source": "deterministic",
+                    }
+                ],
+                "projects": [],
+                "canonical_skills": ["Python"],
+                "parse_warnings": [],
+                "parse_confidence": 0.42,
+            }
+        }
+        extracted_by_id = {"cand.pdf": {"filename": "cand.pdf", "text": "resume text"}}
+
+        with mock.patch.object(ds3_rebuild, "_grok_api_key", return_value="key"):
+            with mock.patch.object(ds3_rebuild, "_call_non_reasoning_grok", side_effect=RuntimeError("boom")):
+                repaired, stats = ds3_rebuild._repair_ambiguous_entries_with_grok(
+                    extracted_by_id,
+                    parsed_by_id,
+                    use_grok="always",
+                    grok_workers=1,
+                )
+
+        entry = repaired["cand.pdf"]["experience"][0]
+        self.assertEqual(stats.entry_grok_candidates, 1)
+        self.assertEqual(stats.entry_grok_repaired, 0)
+        self.assertEqual(entry["repair_source"], "deterministic")
+        self.assertIn("grok_entry_repair_failed:RuntimeError", entry["entry_parse_warnings"])
+
+    def test_unflagged_entries_skip_grok_entry_repair(self):
+        parsed_by_id = {
+            "cand.pdf": {
+                "candidate_id": "cand.pdf",
+                "experience": [
+                    {
+                        "title": "Software Engineer Intern",
+                        "company": "Amazon",
+                        "company_normalized": "amazon",
+                        "dates": ["Jun 2024", "Sep 2024"],
+                        "location": "Seattle, WA",
+                        "bullets": ["Built internal tooling."],
+                        "technologies": ["Java"],
+                        "raw_header": "Software Engineer Intern | Amazon | Seattle, WA | Jun 2024 - Sep 2024",
+                        "raw_text": "Software Engineer Intern | Amazon | Seattle, WA | Jun 2024 - Sep 2024\nBuilt internal tooling.",
+                        "entry_parse_warnings": [],
+                        "entry_parse_confidence": 0.94,
+                        "repair_source": "deterministic",
+                    }
+                ],
+                "projects": [],
+                "canonical_skills": ["Java"],
+                "parse_warnings": [],
+                "parse_confidence": 0.78,
+            }
+        }
+        extracted_by_id = {"cand.pdf": {"filename": "cand.pdf", "text": "resume text"}}
+
+        with mock.patch.object(ds3_rebuild, "_grok_api_key", return_value="key"):
+            with mock.patch.object(ds3_rebuild, "_call_non_reasoning_grok", side_effect=AssertionError("should not run")):
+                repaired, stats = ds3_rebuild._repair_ambiguous_entries_with_grok(
+                    extracted_by_id,
+                    parsed_by_id,
+                    use_grok="always",
+                    grok_workers=1,
+                )
+
+        self.assertEqual(stats.entry_grok_candidates, 0)
+        self.assertEqual(stats.entry_grok_repaired, 0)
+        self.assertEqual(repaired["cand.pdf"]["experience"][0]["repair_source"], "deterministic")
 
     def test_merge_grok_enrichment_preserves_schema_and_technologies(self):
         parsed = {
@@ -187,6 +380,7 @@ Campus Navigation App | React Native, Firebase | Sep 2024 - Dec 2024
         self.assertIn("Scikit-learn", enriched["canonical_skills"])
         self.assertIn("FastAPI", enriched["canonical_skills"])
         self.assertEqual(enriched["experience"][0]["company_normalized"], "northrop grumman")
+        self.assertEqual(enriched["experience"][0]["repair_source"], "grok_resume_enrichment")
         self.assertIn("AWS", enriched["technology_sources"]["experience"])
         self.assertIn("PostgreSQL", enriched["technology_sources"]["projects"])
         self.assertIn("underspecified_projects", enriched["parse_warnings"])
