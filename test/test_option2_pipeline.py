@@ -17,6 +17,7 @@ if str(STREAMLIT_DIR) not in sys.path:
 import grok_utils
 import job_description
 import search
+import components
 
 
 def _make_engine() -> search.SearchEngine:
@@ -46,6 +47,7 @@ def _make_engine() -> search.SearchEngine:
     engine.reranker = None
     engine.reranker_loaded = False
     engine._page_count_cache = {}
+    engine._last_retrieval_details = {}
     engine.strict_startup = False
     engine._startup_issues = []
     return engine
@@ -72,6 +74,21 @@ def _build_result(candidate_id: str, score: float = 0.5) -> search.ResumeResult:
 
 
 class Option2PipelineTests(unittest.TestCase):
+    def test_result_card_html_is_single_block_and_escaped(self):
+        html_output = components._result_card_html(
+            rank=3,
+            display_name='Yi-Hsuan (Tony) Kuo <script>alert(1)</script>',
+            major="Computer Science & Engineering",
+            score_pct="46%",
+            score_col="#eab308",
+        )
+
+        self.assertTrue(html_output.startswith('<div class="result-card">'))
+        self.assertNotIn("\n", html_output)
+        self.assertIn("Yi-Hsuan (Tony) Kuo &lt;script&gt;alert(1)&lt;/script&gt;", html_output)
+        self.assertIn("Computer Science &amp; Engineering", html_output)
+        self.assertTrue(html_output.endswith("</div>"))
+
     def test_strict_startup_raises_when_semantic_backend_or_reranker_missing(self):
         engine = _make_engine()
         engine.strict_startup = True
@@ -96,6 +113,21 @@ class Option2PipelineTests(unittest.TestCase):
         self.assertEqual(parsed.job_title, "Software Engineering Intern")
         self.assertEqual(parsed.company, "Amazon")
         self.assertNotIn("Amazon", parsed.must_have_skills)
+
+    def test_recruiter_overrides_take_precedence_over_parsed_jd(self):
+        parsed = job_description.parse_job_description(
+            "Software Engineering Intern\nUnknown Startup\nSeeking Rivian and Python experience"
+        )
+
+        overridden = job_description.apply_recruiter_overrides(
+            parsed,
+            recruiter_company="Rivian",
+            recruiter_job_title="Software Engineer, Vehicle Systems",
+        )
+
+        self.assertEqual(overridden.company, "Rivian")
+        self.assertEqual(overridden.job_title, "Software Engineer, Vehicle Systems")
+        self.assertNotIn("Rivian", overridden.must_have_skills)
 
     def test_company_normalization_equivalence(self):
         self.assertEqual(search._normalize_company_name("Northrop Grumman Corp."), "northrop grumman")
@@ -189,6 +221,167 @@ class Option2PipelineTests(unittest.TestCase):
         self.assertEqual(seen["grok_top_n"], 10)
         self.assertEqual(len(results), 10)
 
+    def test_search_job_description_uses_recruiter_company_override(self):
+        engine = _make_engine()
+        seen: dict[str, str] = {}
+
+        def fake_retrieve(self, query, parsed, top_k):
+            seen["company"] = parsed.company
+            seen["job_title"] = parsed.job_title
+            return []
+
+        def fake_aggregate(self, chunk_hits, parsed, top_k, min_score, grad_year_filter, major_filter):
+            return []
+
+        def fake_apply_grok(self, query, results, parsed, top_n, api_key=None, final_top_k=None, progress_callback=None):
+            return results
+
+        engine._retrieve_chunks = MethodType(fake_retrieve, engine)
+        engine._aggregate_chunk_hits = MethodType(fake_aggregate, engine)
+        engine._apply_grok_scores = MethodType(fake_apply_grok, engine)
+
+        engine._search_job_description(
+            query="Software Engineering Intern\nUnknown Startup\nSeeking Python experience.",
+            top_k=10,
+            min_score=0.0,
+            grad_year_filter=None,
+            major_filter=None,
+            recruiter_company="Rivian",
+            recruiter_job_title="Vehicle Software Intern",
+        )
+
+        self.assertEqual(seen["company"], "Rivian")
+        self.assertEqual(seen["job_title"], "Vehicle Software Intern")
+
+    def test_structured_retrieval_query_uses_company_title_and_skills(self):
+        engine = _make_engine()
+        parsed = job_description.apply_recruiter_overrides(
+            job_description.parse_job_description(
+                "Unknown title\nUnknown company\nSeeking Python and React experience."
+            ),
+            recruiter_company="Rivian",
+            recruiter_job_title="Software Engineering Intern",
+        )
+
+        retrieval_query = engine._build_structured_retrieval_query("raw jd text", parsed)
+
+        self.assertIn("Rivian", retrieval_query)
+        self.assertIn("Software Engineering Intern", retrieval_query)
+        self.assertIn("Python", retrieval_query)
+        self.assertIn("React", retrieval_query)
+
+    def test_candidate_profile_extracts_social_links_from_contact_when_metadata_missing(self):
+        engine = _make_engine()
+        engine.parsed_resume_map = {
+            "member_resume_yi-hsuan_kuo.pdf": {
+                "contact": (
+                    "Yi-Hsuan (Tony) Kuo\n"
+                    "La Jolla | y3kuo@ucsd.edu | https://github.com/YihsuanKuo | linkedin.com/in/yi-hsuan-kuo"
+                ),
+                "summary": "",
+                "skills": [],
+                "canonical_skills": [],
+                "experience": [],
+                "education": [],
+                "projects": [],
+                "metadata": {},
+                "source": "ds3_members",
+            }
+        }
+        engine.resume_metadata_by_filename = {
+            "member_resume_yi-hsuan_kuo.pdf": {
+                "filename": "member_resume_yi-hsuan_kuo.pdf",
+                "full_name": "",
+                "linkedin": "",
+                "github": "",
+                "resume_link": "",
+                "source": "ds3_members",
+                "file_path": "",
+                "text": "",
+            }
+        }
+
+        profile = engine._get_candidate_profile("member_resume_yi-hsuan_kuo.pdf")
+
+        self.assertEqual(profile["full_name"], "Yi-Hsuan (Tony) Kuo")
+        self.assertEqual(profile["github"], "https://github.com/YihsuanKuo")
+        self.assertEqual(profile["linkedin"], "https://linkedin.com/in/yi-hsuan-kuo")
+
+    def test_hybrid_retrieval_combines_semantic_and_lexical_hits(self):
+        engine = _make_engine()
+        engine.retrieval_backend = "semantic-chunk"
+        engine.index = object()
+        engine.model = object()
+        engine.chunk_metadata = [{"candidate_id": "semantic.pdf"}]
+        engine.chunk_candidates = [{"candidate_id": "lexical.pdf"}]
+
+        parsed = job_description.apply_recruiter_overrides(
+            job_description.parse_job_description("Software Engineering Intern\nRivian\nPython and React"),
+            recruiter_company="Rivian",
+            recruiter_job_title="Software Engineering Intern",
+        )
+
+        engine._semantic_chunk_search = MethodType(
+            lambda self, query, top_k: [
+                search.ChunkHit("semantic.pdf", "semantic-1", "experience", "semantic hit", 0.8, "ds3_members", "semantic")
+            ],
+            engine,
+        )
+        engine._lexical_chunk_search = MethodType(
+            lambda self, query, parsed, top_k: [
+                search.ChunkHit("lexical.pdf", "lexical-1", "experience", "lexical hit", 0.9, "ds3_members", "lexical")
+            ],
+            engine,
+        )
+        engine._build_company_rescue_hits = MethodType(lambda self, parsed, existing_candidate_ids, limit=search.COMPANY_RESCUE_LIMIT: [], engine)
+
+        hits = engine._retrieve_chunks("jd", parsed, top_k=10)
+
+        self.assertEqual({hit.candidate_id for hit in hits}, {"semantic.pdf", "lexical.pdf"})
+        self.assertEqual(engine._last_retrieval_details["semantic_chunks"], 1)
+        self.assertEqual(engine._last_retrieval_details["lexical_chunks"], 1)
+        self.assertEqual(engine._last_retrieval_details["hybrid_unique_chunks"], 2)
+
+    def test_company_rescue_adds_missing_same_company_candidate(self):
+        engine = _make_engine()
+        engine.parsed_resume_map = {
+            "kaii.pdf": {
+                "candidate_id": "kaii.pdf",
+                "source": "ds3_members",
+                "metadata": {"full_name": "Kaii Bijlani", "major": "Data Science", "graduation_year": "2027"},
+                "experience": [
+                    {
+                        "title": "Software Engineering Intern",
+                        "company": "Rivian",
+                        "company_normalized": "rivian",
+                        "dates": ["Jun 2025", "Sep 2025"],
+                        "bullets": ["Built Databricks pipelines in Python."],
+                        "technologies": ["Python", "Databricks"],
+                        "raw_text": "Software Engineering Intern\nRivian\nBuilt Databricks pipelines in Python.",
+                    }
+                ],
+                "projects": [],
+                "education": [],
+                "summary": "",
+                "canonical_skills": ["Python", "React", "TypeScript", "AWS"],
+            }
+        }
+        engine.resume_metadata_by_filename = {
+            "kaii.pdf": {"filename": "kaii.pdf", "file_path": "", "source": "ds3_members", "text": "Kaii resume"}
+        }
+        parsed = job_description.apply_recruiter_overrides(
+            job_description.parse_job_description("Software Engineering Intern\nRivian\nPython React TypeScript AWS"),
+            recruiter_company="Rivian",
+            recruiter_job_title="Software Engineering Intern",
+        )
+
+        rescue_hits = engine._build_company_rescue_hits(parsed, existing_candidate_ids=set())
+
+        self.assertEqual(len(rescue_hits), 1)
+        self.assertEqual(rescue_hits[0].candidate_id, "kaii.pdf")
+        self.assertEqual(rescue_hits[0].retrieval_source, "company_rescue")
+        self.assertGreater(rescue_hits[0].score, 0.58)
+
     def test_same_company_candidate_receives_stronger_retrieval_score(self):
         engine = _make_engine()
         engine.resume_metadata_by_filename = {
@@ -258,6 +451,7 @@ class Option2PipelineTests(unittest.TestCase):
         self.assertEqual(results[0].candidate_id, "same.pdf")
         self.assertEqual(results[0].company_match_status, "exact_experience_match")
         self.assertNotEqual(results[0].retrieval_score, results[1].retrieval_score)
+        self.assertIn(results[0].ranking_details["retrieval_source"], {"unknown", "semantic", "lexical", "hybrid", "company_rescue"})
 
     def test_grok_scores_only_top_ten_candidates(self):
         engine = _make_engine()
@@ -341,34 +535,46 @@ class Option2PipelineTests(unittest.TestCase):
                 api = importlib.import_module("api")
 
         api.engine.last_query_analysis = {"job_title": "Intern"}
-        api.engine.search = lambda **kwargs: [
-            search.ResumeResult(
-                rank=1,
-                filename="candidate.pdf",
-                candidate_id="candidate.pdf",
-                score=0.88,
-                semantic_score=0.77,
-                file_path="/tmp/candidate.pdf",
-                local_resume_path="/tmp/candidate.pdf",
-                text_preview="Preview",
-                full_name="Candidate",
-                major="Computer Science",
-                graduation_year="2027",
-                page_count=2,
-                company_match_status="exact_experience_match",
-                grok_status="ok",
-                grok_fit_score=0.83,
-                grok_resume_quality_score=0.71,
-                grok_summary="Strong fit.",
-                grok_matched_requirements=["Python"],
-                grok_missing_requirements=["unclear: citizenship"],
-                grok_weakness_flags=["weak_or_unquantified_bullets"],
-            )
-        ]
+        seen: dict[str, str] = {}
+
+        def fake_search(**kwargs):
+            seen["recruiter_company"] = kwargs.get("recruiter_company")
+            seen["recruiter_job_title"] = kwargs.get("recruiter_job_title")
+            return [
+                search.ResumeResult(
+                    rank=1,
+                    filename="candidate.pdf",
+                    candidate_id="candidate.pdf",
+                    score=0.88,
+                    semantic_score=0.77,
+                    file_path="/tmp/candidate.pdf",
+                    local_resume_path="/tmp/candidate.pdf",
+                    text_preview="Preview",
+                    full_name="Candidate",
+                    major="Computer Science",
+                    graduation_year="2027",
+                    page_count=2,
+                    company_match_status="exact_experience_match",
+                    grok_status="ok",
+                    grok_fit_score=0.83,
+                    grok_resume_quality_score=0.71,
+                    grok_summary="Strong fit.",
+                    grok_matched_requirements=["Python"],
+                    grok_missing_requirements=["unclear: citizenship"],
+                    grok_weakness_flags=["weak_or_unquantified_bullets"],
+                )
+            ]
+
+        api.engine.search = fake_search
 
         payload = asyncio.run(
             api.search_resumes(
-                api.SearchRequest(query="python intern", input_mode="Job Description")
+                api.SearchRequest(
+                    query="python intern",
+                    input_mode="Job Description",
+                    recruiter_company="Rivian",
+                    recruiter_job_title="Vehicle Software Intern",
+                )
             )
         )
 
@@ -378,6 +584,69 @@ class Option2PipelineTests(unittest.TestCase):
         self.assertEqual(result["grok_status"], "ok")
         self.assertEqual(result["grok_matched_requirements"], ["Python"])
         self.assertEqual(result["grok_missing_requirements"], ["unclear: citizenship"])
+        self.assertEqual(seen["recruiter_company"], "Rivian")
+        self.assertEqual(seen["recruiter_job_title"], "Vehicle Software Intern")
+
+    def test_dedupe_results_prefers_highest_scoring_duplicate_identity(self):
+        engine = _make_engine()
+        low = _build_result("resume_a.pdf", 0.61)
+        low.full_name = "Viet Minh Hieu Nguyen"
+        low.linkedin = "https://www.linkedin.com/in/vietminhhieunguyen/"
+        high = _build_result("resume_b.pdf", 0.82)
+        high.full_name = "Hieu Nguyen"
+        high.linkedin = "https://www.linkedin.com/in/vietminhhieunguyen/"
+
+        deduped = engine._dedupe_results([low, high])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].candidate_id, "resume_b.pdf")
+        self.assertEqual(deduped[0].ranking_details["deduped_duplicate_count"], 2)
+
+    def test_dedupe_results_does_not_collapse_single_token_names(self):
+        engine = _make_engine()
+        first = _build_result("daniel_a.pdf", 0.7)
+        first.full_name = "Daniel"
+        first.graduation_year = "2027"
+        first.major = "Computer Science"
+        second = _build_result("daniel_b.pdf", 0.69)
+        second.full_name = "Daniel"
+        second.graduation_year = "2027"
+        second.major = "Computer Science"
+
+        deduped = engine._dedupe_results([first, second])
+
+        self.assertEqual(len(deduped), 2)
+
+    def test_candidate_profile_falls_back_to_contact_name_when_metadata_missing(self):
+        engine = _make_engine()
+        engine.resume_metadata_by_filename = {
+            "board_resume_1.pdf": {
+                "filename": "board_resume_1.pdf",
+                "file_path": "",
+                "text": "resume text",
+                "source": "ds3_board",
+                "full_name": "",
+            }
+        }
+        engine.parsed_resume_map = {
+            "board_resume_1.pdf": {
+                "candidate_id": "board_resume_1.pdf",
+                "source": "ds3_board",
+                "file_path": "",
+                "metadata": {},
+                "contact": "Mohak A. Prakash\nmprakash@ucsd.edu",
+                "summary": "",
+                "education": [],
+                "experience": [],
+                "projects": [],
+                "skills": [],
+                "canonical_skills": [],
+            }
+        }
+
+        profile = engine._get_candidate_profile("board_resume_1.pdf")
+
+        self.assertEqual(profile["full_name"], "Mohak A. Prakash")
 
 
 if __name__ == "__main__":

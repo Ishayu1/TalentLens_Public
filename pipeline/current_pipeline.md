@@ -16,7 +16,8 @@ flowchart TD
 
     subgraph Online["Live Search"]
         I["Recruiter pastes JD"] --> J["JD parser\ncompany / must-haves / preferred /\nyears / degree / location"]
-        J --> K["FAISS chunk retrieval\nmax(top_k * 10, 250) chunks"]
+        J --> J2["Optional recruiter overrides\ncompany + job title"]
+        J2 --> K["FAISS chunk retrieval\nmax(top_k * 10, 250) chunks"]
         K --> L["Aggregate by candidate\nretrieval score + must-have coverage + company match"]
         L --> M["Cross-encoder reranker\ncandidate pool = max(top_k * 3, 30)"]
         M --> N["Grok reasoning scorer\npost-rerank top 10 only"]
@@ -58,6 +59,7 @@ Used by:
 
 What it does for job-description search:
 - Parses the JD into structured requirements
+- Lets the recruiter optionally override `company` and `job title`
 - Retrieves chunks from FAISS
 - Aggregates chunks into candidate profiles
 - Applies company matching from structured experience data

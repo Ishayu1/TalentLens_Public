@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from copy import deepcopy
 import re
 
 try:
@@ -102,6 +103,33 @@ class ParsedJobDescription:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def apply_recruiter_overrides(
+    parsed: ParsedJobDescription,
+    recruiter_company: str | None = None,
+    recruiter_job_title: str | None = None,
+) -> ParsedJobDescription:
+    updated = deepcopy(parsed)
+
+    company_override = str(recruiter_company or "").strip()
+    if company_override:
+        updated.company = company_override
+        company_tokens = {company_override.lower(), company_override.split()[0].lower()}
+        updated.must_have_skills = [
+            skill for skill in updated.must_have_skills
+            if skill.lower() not in company_tokens
+        ]
+        updated.preferred_skills = [
+            skill for skill in updated.preferred_skills
+            if skill.lower() not in company_tokens
+        ]
+
+    title_override = str(recruiter_job_title or "").strip()
+    if title_override:
+        updated.job_title = title_override
+
+    return updated
 
 
 def _clean_lines(text: str) -> list[str]:

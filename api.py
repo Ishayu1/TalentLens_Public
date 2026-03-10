@@ -18,6 +18,8 @@ class SearchRequest(BaseModel):
     top_k: int = 10
     min_score: float = 0.0
     input_mode: str = "Skills"
+    recruiter_company: str | None = None
+    recruiter_job_title: str | None = None
 
 
 @app.post("/search")
@@ -30,6 +32,8 @@ async def search_resumes(request: SearchRequest):
         top_k=request.top_k,
         min_score=request.min_score,
         input_mode=request.input_mode,
+        recruiter_company=request.recruiter_company,
+        recruiter_job_title=request.recruiter_job_title,
     )
 
     return {

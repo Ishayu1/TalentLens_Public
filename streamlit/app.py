@@ -61,6 +61,8 @@ if st.session_state.get("_pending_clear"):
     st.session_state["last_results"] = []
     st.session_state["last_job_description_analysis"] = None
     st.session_state["search_query"] = ""
+    st.session_state["recruiter_company_override"] = ""
+    st.session_state["recruiter_job_title_override"] = ""
 
 if st.session_state.get("_pending_clear_input"):
     st.session_state["_pending_clear_input"] = False
@@ -84,7 +86,7 @@ grad_year_filter, major_filter, top_k = render_sidebar_filters(grad_years, major
 
 render_sidebar_stats(engine.resume_count, engine.mode_label)
 
-query, search_clicked, clear_clicked = render_search_bar(selected_skills)
+query, search_clicked, clear_clicked, recruiter_company, recruiter_job_title = render_search_bar(selected_skills)
 
 if clear_clicked:
     st.session_state["_pending_clear"] = True
@@ -124,6 +126,8 @@ if search_clicked:
             grad_year_filter=grad_year_filter,
             major_filter=major_filter,
             input_mode="Job Description",
+            recruiter_company=recruiter_company,
+            recruiter_job_title=recruiter_job_title,
         )
         st.session_state["last_results"] = results
         st.session_state["last_job_description_analysis"] = engine.last_query_analysis

@@ -33,7 +33,7 @@ try:
         RERANKER_ENABLED,
         RERANKER_MODEL_PATH,
     )
-    from job_description import ParsedJobDescription, parse_job_description
+    from job_description import ParsedJobDescription, apply_recruiter_overrides, parse_job_description
     from grok_utils import assess_candidate_packet_with_grok, has_grok_api_key
 except ImportError:
     from streamlit.config import (
@@ -52,7 +52,7 @@ except ImportError:
         RERANKER_ENABLED,
         RERANKER_MODEL_PATH,
     )
-    from streamlit.job_description import ParsedJobDescription, parse_job_description
+    from streamlit.job_description import ParsedJobDescription, apply_recruiter_overrides, parse_job_description
     from streamlit.grok_utils import assess_candidate_packet_with_grok, has_grok_api_key
 
 
@@ -98,11 +98,19 @@ COMPANY_SUFFIXES = {
 COMPANY_LOCATION_RE = re.compile(
     r"\b(?:remote|hybrid|on[- ]site|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b.*$"
 )
+EMAIL_RE = re.compile(r"[\w.\-+]+@[\w.\-]+\.\w+")
+PHONE_RE = re.compile(r"(?:\+?1[-.\s]*)?(?:\(\d{3}\)|\d{3})[-.\s]*\d{3}[-.\s]*\d{4}")
+URL_RE = re.compile(r"https?://\S+|linkedin\.com/\S+|github\.com/\S+", re.I)
+SOCIAL_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:linkedin\.com/\S+|github\.com/\S+|[\w.-]+\.github\.io\S*)",
+    re.I,
+)
 FINAL_PAGE_PENALTY = 0.04
 GROK_TOP_N = 10
 GROK_MAX_WORKERS = max(1, min(8, int(os.getenv("TALENTLENS_GROK_MAX_WORKERS", "6"))))
 STRONG_COMPANY_BOOST = 0.18
 WEAK_COMPANY_MENTION_BOOST = 0.05
+COMPANY_RESCUE_LIMIT = 15
 
 
 @dataclass
@@ -156,6 +164,7 @@ class ChunkHit:
     text: str
     score: float
     source: str
+    retrieval_source: str = "unknown"
 
 
 def _build_skill_patterns():
@@ -198,9 +207,76 @@ def _normalize_company_name(name: str) -> str:
     return " ".join(tokens)
 
 
+def _hybrid_retrieval_source(hit_sources: set[str]) -> str:
+    ordered = [source for source in ("semantic", "lexical", "company_rescue") if source in hit_sources]
+    if not ordered:
+        return "unknown"
+    if len(ordered) == 1:
+        return ordered[0]
+    if "company_rescue" in ordered and len(ordered) == 1:
+        return "company_rescue"
+    return "hybrid"
+
+
+def _normalize_identity_value(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _looks_like_full_name(name: str) -> bool:
+    tokens = [token for token in re.split(r"\s+", (name or "").strip()) if token]
+    return len(tokens) >= 2
+
+
+def _extract_name_from_contact(contact: str) -> str:
+    first_line = str(contact or "").splitlines()[0].strip()
+    if not first_line:
+        return ""
+    if EMAIL_RE.search(first_line) or PHONE_RE.search(first_line) or URL_RE.search(first_line):
+        return ""
+    return first_line
+
+
 def _normalize_free_text(text: str) -> str:
     cleaned = re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _clean_extracted_url(url: str) -> str:
+    cleaned = str(url or "").strip().strip("()[]{}<>,.;")
+    cleaned = re.sub(r"^(?:cid:\d+)+", "", cleaned, flags=re.I).strip()
+    if not cleaned:
+        return ""
+    if not re.match(r"^[a-z]+://", cleaned, flags=re.I):
+        cleaned = f"https://{cleaned.lstrip('/')}"
+    return cleaned
+
+
+def _extract_contact_links(text: str) -> dict[str, str]:
+    links = {"resume_link": "", "linkedin": "", "github": ""}
+    for match in SOCIAL_URL_RE.finditer(str(text or "")):
+        raw_url = match.group(0)
+        url = _clean_extracted_url(raw_url)
+        if not url:
+            continue
+        normalized = url.lower()
+        if "linkedin.com/" in normalized and not links["linkedin"]:
+            links["linkedin"] = url
+        elif "github.com/" in normalized and not links["github"]:
+            links["github"] = url
+        elif not links["resume_link"]:
+            links["resume_link"] = url
+    return links
+
+
+def _merge_profile_links(*sources: dict[str, str]) -> dict[str, str]:
+    merged = {"resume_link": "", "linkedin": "", "github": ""}
+    for key in merged:
+        for source in sources:
+            value = str((source or {}).get(key, "")).strip()
+            if value:
+                merged[key] = value
+                break
+    return merged
 
 
 def _company_names_equivalent(left: str, right: str) -> bool:
@@ -310,6 +386,7 @@ class SearchEngine:
         self.reranker = None
         self.reranker_loaded = False
         self._page_count_cache: dict[str, int | None] = {}
+        self._last_retrieval_details: dict[str, Any] = {}
         self.strict_startup = strict_startup
         self._startup_issues: list[str] = []
         self._load()
@@ -540,6 +617,8 @@ class SearchEngine:
         major_filter: str | None = None,
         input_mode: str = "Skills",
         api_key: str | None = None,
+        recruiter_company: str | None = None,
+        recruiter_job_title: str | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> list[ResumeResult]:
         self.last_query_analysis = None
@@ -553,10 +632,13 @@ class SearchEngine:
                 grad_year_filter,
                 major_filter,
                 api_key,
+                recruiter_company,
+                recruiter_job_title,
                 progress_callback,
             )
         self._emit_progress(progress_callback, 0.1, "Matching skill filters")
         results = self._search_skills(query, top_k, min_score, skill_filters, grad_year_filter, major_filter)
+        results = self._dedupe_results(results)
         self._emit_progress(progress_callback, 1.0, "Search complete")
         return results
 
@@ -568,10 +650,16 @@ class SearchEngine:
         grad_year_filter: str | None,
         major_filter: str | None,
         api_key: str | None = None,
+        recruiter_company: str | None = None,
+        recruiter_job_title: str | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> list[ResumeResult]:
         self._emit_progress(progress_callback, 0.05, "Parsing job description")
-        parsed = parse_job_description(query)
+        parsed = apply_recruiter_overrides(
+            parse_job_description(query),
+            recruiter_company=recruiter_company,
+            recruiter_job_title=recruiter_job_title,
+        )
         chunk_fetch_k = max(top_k * 10, 250)
         candidate_pool_limit = max(top_k * 3, 30)
         self._emit_progress(progress_callback, 0.15, "Retrieving resume evidence")
@@ -595,6 +683,7 @@ class SearchEngine:
                 "candidate_pool_limit": candidate_pool_limit,
                 "reranker_active": self.reranker_loaded,
                 "grok_top_n": GROK_TOP_N,
+                **getattr(self, "_last_retrieval_details", {}),
             },
         }
         if self.reranker_loaded:
@@ -610,6 +699,7 @@ class SearchEngine:
             final_top_k=top_k,
             progress_callback=progress_callback,
         )
+        results = self._dedupe_results(results)
         self._emit_progress(progress_callback, 1.0, "Search complete")
         return results[:top_k]
 
@@ -631,9 +721,10 @@ class SearchEngine:
         for meta, raw_score in zip(self.resume_metadata, scores):
             if raw_score < min_score:
                 continue
+            profile = self._get_candidate_profile(meta.get("filename", ""))
             member_info = self._lookup_member(meta.get("filename", ""), meta.get("text", ""))
-            grad_year = member_info.get("graduation_year", meta.get("graduation_year", ""))
-            major = member_info.get("major", meta.get("major", ""))
+            grad_year = member_info.get("graduation_year", profile.get("graduation_year", meta.get("graduation_year", "")))
+            major = member_info.get("major", profile.get("major", meta.get("major", "")))
             if grad_year_filter and str(grad_year) != grad_year_filter:
                 continue
             if major_filter and major_filter.lower() not in str(major).lower():
@@ -653,12 +744,12 @@ class SearchEngine:
                     text_preview=text[:400],
                     full_text=text,
                     source=meta.get("source", DEFAULT_MEMBER_SOURCE),
-                    full_name=member_info.get("full_name", meta.get("full_name", meta.get("filename", ""))),
+                    full_name=member_info.get("full_name", profile.get("full_name", meta.get("full_name", meta.get("filename", "")))),
                     major=major,
                     graduation_year=str(grad_year),
-                    resume_link=member_info.get("resume_link", meta.get("resume_link", "")),
-                    linkedin=member_info.get("linkedin", meta.get("linkedin", "")),
-                    github=member_info.get("github", meta.get("github", "")),
+                    resume_link=member_info.get("resume_link", profile.get("resume_link", meta.get("resume_link", ""))),
+                    linkedin=member_info.get("linkedin", profile.get("linkedin", meta.get("linkedin", ""))),
+                    github=member_info.get("github", profile.get("github", meta.get("github", ""))),
                     matched_skills=matched,
                     retrieval_score=final_score,
                     top_evidence_chunks=[
@@ -678,10 +769,11 @@ class SearchEngine:
             )
 
         scored_rows.sort(key=lambda item: item.score, reverse=True)
-        top_results = scored_rows[:top_k]
+        top_results = self._dedupe_results(scored_rows)[:top_k]
 
         if self.reranker_loaded and self.reranker is not None and top_results:
             top_results = self._rerank(query, top_results)
+            top_results = self._dedupe_results(top_results)[:top_k]
 
         for i, result in enumerate(top_results, 1):
             result.rank = i
@@ -703,8 +795,11 @@ class SearchEngine:
             must_haves = (getattr(results[0], "hard_filter_status", {}) or {}).get("matched_must_have_skills", []) or []
             parsed_company = (getattr(self, "last_query_analysis", {}) or {}).get("company", "")
 
+        query_title = query.splitlines()[0]
+        if parsed and parsed.job_title:
+            query_title = parsed.job_title
         prefix = f"{parsed_company} " if parsed_company else ""
-        clean_query = f"{prefix}{query.splitlines()[0]} | {', '.join(must_haves)}"
+        clean_query = f"{prefix}{query_title} | {', '.join(must_haves)}"
 
         for r in results:
             evidence_text = ""
@@ -997,11 +1092,184 @@ class SearchEngine:
         )
         return max(0.001, min(0.999, final_score))
 
+    def _result_identity_key(self, result: ResumeResult) -> str | None:
+        for label, raw_value in (
+            ("linkedin", result.linkedin),
+            ("resume_link", result.resume_link),
+            ("github", result.github),
+        ):
+            normalized = _normalize_identity_value(str(raw_value or ""))
+            if normalized:
+                return f"{label}:{normalized}"
+
+        name = _normalize_identity_value(result.full_name)
+        major = _normalize_identity_value(result.major)
+        grad_year = _normalize_identity_value(result.graduation_year)
+        if name and _looks_like_full_name(name) and (major or grad_year):
+            return f"profile:{name}|{grad_year}|{major}"
+        return None
+
+    def _dedupe_results(self, results: list[ResumeResult]) -> list[ResumeResult]:
+        if not results:
+            return results
+
+        deduped: list[ResumeResult] = []
+        seen_identities: dict[str, ResumeResult] = {}
+        for result in results:
+            identity_key = self._result_identity_key(result)
+            if not identity_key:
+                deduped.append(result)
+                continue
+
+            existing = seen_identities.get(identity_key)
+            if existing is None:
+                seen_identities[identity_key] = result
+                deduped.append(result)
+                continue
+
+            if result.score > existing.score:
+                existing_index = deduped.index(existing)
+                result.ranking_details = {
+                    **result.ranking_details,
+                    "deduped_identity": identity_key,
+                    "deduped_duplicate_count": existing.ranking_details.get("deduped_duplicate_count", 1) + 1,
+                }
+                deduped[existing_index] = result
+                seen_identities[identity_key] = result
+            else:
+                existing.ranking_details["deduped_identity"] = identity_key
+                existing.ranking_details["deduped_duplicate_count"] = existing.ranking_details.get("deduped_duplicate_count", 1) + 1
+
+        deduped.sort(key=lambda item: item.score, reverse=True)
+        for index, result in enumerate(deduped, 1):
+            result.rank = index
+        return deduped
+
+    def _build_structured_retrieval_query(self, query: str, parsed: ParsedJobDescription) -> str:
+        parts: list[str] = []
+        if parsed.company:
+            parts.append(parsed.company)
+        if parsed.job_title:
+            parts.append(parsed.job_title)
+        elif query.strip():
+            parts.append(query.splitlines()[0].strip())
+        if parsed.must_have_skills:
+            parts.append("Must have: " + ", ".join(parsed.must_have_skills))
+        if parsed.preferred_skills:
+            parts.append("Preferred: " + ", ".join(parsed.preferred_skills))
+        if query.strip():
+            parts.append(query.strip())
+        return "\n".join(part for part in parts if part).strip() or query
+
+    def _combine_chunk_hits(
+        self,
+        semantic_hits: list[ChunkHit],
+        lexical_hits: list[ChunkHit],
+        rescue_hits: list[ChunkHit],
+        top_k: int,
+    ) -> list[ChunkHit]:
+        merged: dict[tuple[str, str], ChunkHit] = {}
+        source_tracker: dict[tuple[str, str], set[str]] = {}
+        for hit in semantic_hits + lexical_hits + rescue_hits:
+            key = (hit.candidate_id, hit.chunk_id)
+            source_tracker.setdefault(key, set()).add(hit.retrieval_source)
+            existing = merged.get(key)
+            if existing is None or hit.score > existing.score:
+                merged[key] = ChunkHit(
+                    candidate_id=hit.candidate_id,
+                    chunk_id=hit.chunk_id,
+                    section_type=hit.section_type,
+                    text=hit.text,
+                    score=hit.score,
+                    source=hit.source,
+                    retrieval_source=hit.retrieval_source,
+                )
+        combined = list(merged.values())
+        for hit in combined:
+            sources = source_tracker.get((hit.candidate_id, hit.chunk_id), set())
+            hit.retrieval_source = _hybrid_retrieval_source(sources)
+        combined.sort(key=lambda item: item.score, reverse=True)
+        return combined[:top_k]
+
+    def _build_company_rescue_hits(
+        self,
+        parsed: ParsedJobDescription,
+        existing_candidate_ids: set[str],
+        limit: int = COMPANY_RESCUE_LIMIT,
+    ) -> list[ChunkHit]:
+        normalized_company = _normalize_company_name(parsed.company)
+        if not normalized_company:
+            return []
+
+        rescue_candidates: list[tuple[float, ChunkHit]] = []
+        for candidate_id, parsed_resume in self.parsed_resume_map.items():
+            if not candidate_id or candidate_id in existing_candidate_ids:
+                continue
+            experience_entries = parsed_resume.get("experience", [])
+            matching_entry = None
+            for entry in experience_entries:
+                if not isinstance(entry, dict):
+                    continue
+                if _normalize_company_name(str(entry.get("company", ""))) == normalized_company:
+                    matching_entry = entry
+                    break
+            if matching_entry is None:
+                continue
+
+            profile = self._get_candidate_profile(candidate_id)
+            matched_must_haves = extract_matched_skills(profile.get("combined_text", ""), parsed.must_have_skills)
+            must_have_ratio = len(matched_must_haves) / max(len(parsed.must_have_skills), 1) if parsed.must_have_skills else 1.0
+            rescue_score = min(0.82, 0.58 + (0.18 * must_have_ratio))
+            entry_text = _summarize_structured_entry("Role", matching_entry, "title", "company") or str(matching_entry.get("raw_text", ""))
+            rescue_candidates.append(
+                (
+                    rescue_score,
+                    ChunkHit(
+                        candidate_id=candidate_id,
+                        chunk_id=f"company_rescue::{candidate_id}",
+                        section_type="experience",
+                        text=entry_text[:1200],
+                        score=rescue_score,
+                        source=profile.get("source", DEFAULT_MEMBER_SOURCE),
+                        retrieval_source="company_rescue",
+                    ),
+                )
+            )
+
+        rescue_candidates.sort(key=lambda item: item[0], reverse=True)
+        return [hit for _, hit in rescue_candidates[:limit]]
+
     def _retrieve_chunks(self, query: str, parsed: ParsedJobDescription, top_k: int) -> list[ChunkHit]:
+        self._last_retrieval_details = {
+            "semantic_chunks": 0,
+            "lexical_chunks": 0,
+            "hybrid_unique_chunks": 0,
+            "rescued_company_candidates": 0,
+            "company_override_used": parsed.company or "",
+            "job_title_override_used": parsed.job_title or "",
+        }
+        semantic_hits: list[ChunkHit] = []
+        lexical_hits: list[ChunkHit] = []
+        rescue_hits: list[ChunkHit] = []
+
         if self.retrieval_backend == "semantic-chunk" and self.index is not None and self.model is not None and self.chunk_metadata:
-            return self._semantic_chunk_search(query, top_k)
+            semantic_query = self._build_structured_retrieval_query(query, parsed)
+            semantic_hits = self._semantic_chunk_search(semantic_query, top_k)
         if self.chunk_candidates:
-            return self._lexical_chunk_search(query, parsed, top_k)
+            lexical_hits = self._lexical_chunk_search(query, parsed, top_k)
+        if semantic_hits or lexical_hits:
+            existing_candidate_ids = {hit.candidate_id for hit in semantic_hits + lexical_hits if hit.candidate_id}
+            rescue_hits = self._build_company_rescue_hits(parsed, existing_candidate_ids)
+            combined_hits = self._combine_chunk_hits(semantic_hits, lexical_hits, rescue_hits, top_k)
+            self._last_retrieval_details = {
+                "semantic_chunks": len(semantic_hits),
+                "lexical_chunks": len(lexical_hits),
+                "hybrid_unique_chunks": len(combined_hits),
+                "rescued_company_candidates": len(rescue_hits),
+                "company_override_used": parsed.company or "",
+                "job_title_override_used": parsed.job_title or "",
+            }
+            return combined_hits
         return self._resume_as_chunk_search(query, top_k)
 
     def _semantic_chunk_search(self, query: str, top_k: int) -> list[ChunkHit]:
@@ -1025,6 +1293,7 @@ class SearchEngine:
                     text=row.get("text", ""),
                     score=float(max(0.0, score)) * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
                     source=row.get("source", DEFAULT_MEMBER_SOURCE),
+                    retrieval_source="semantic",
                 )
             )
         return hits
@@ -1055,6 +1324,7 @@ class SearchEngine:
                     text=row.get("text", ""),
                     score=score * SECTION_WEIGHTS.get(row.get("section_type", "other"), 0.65),
                     source=row.get("source", DEFAULT_MEMBER_SOURCE),
+                    retrieval_source="lexical",
                 )
             )
         return hits
@@ -1073,6 +1343,7 @@ class SearchEngine:
                     text=row.get("text", "")[:500],
                     score=float(scores[idx]),
                     source=row.get("source", DEFAULT_MEMBER_SOURCE),
+                    retrieval_source="resume",
                 )
             )
         return hits
@@ -1128,11 +1399,14 @@ class SearchEngine:
 
             member_info = self._lookup_member(candidate_id, profile.get("combined_text", ""))
             display_meta = self.resume_metadata_by_filename.get(candidate_id, {})
+            hit_sources = {hit.retrieval_source for hit in hits if hit.retrieval_source}
+            retrieval_source = _hybrid_retrieval_source(hit_sources)
             top_evidence = [
                 {
                     "section_type": hit.section_type,
                     "score": round(hit.score, 4),
                     "text": hit.text,
+                    "retrieval_source": hit.retrieval_source,
                 }
                 for hit in hits[:3]
             ]
@@ -1177,6 +1451,8 @@ class SearchEngine:
                         "total_preferred_count": len(parsed.preferred_skills),
                         "company_match_status": company_match_status,
                         "company_boost": round(company_boost, 4),
+                        "retrieval_source": retrieval_source,
+                        "rescued_company_candidate": "company_rescue" in hit_sources,
                     },
                 )
             )
@@ -1308,9 +1584,27 @@ class SearchEngine:
         if not employer_names:
             employer_names = _extract_employer_names(experience_entries)
 
-        full_name = metadata.get("full_name", meta.get("full_name", candidate_id))
+        full_name = (
+            metadata.get("full_name")
+            or meta.get("full_name")
+            or _extract_name_from_contact(parsed.get("contact", ""))
+            or candidate_id
+        )
         major = metadata.get("major", meta.get("major", ""))
         graduation_year = str(metadata.get("graduation_year", meta.get("graduation_year", "")))
+        extracted_links = _extract_contact_links(
+            "\n".join(
+                filter(
+                    None,
+                    [
+                        str(parsed.get("contact", "")),
+                        str(meta.get("text", ""))[:800],
+                        "\n".join(URL_RE.findall(str(parsed.get("contact", "")))),
+                    ],
+                )
+            )
+        )
+        resolved_links = _merge_profile_links(metadata, meta, extracted_links)
         profile = {
             "candidate_id": candidate_id,
             "file_path": meta.get("file_path", parsed.get("file_path", "")),
@@ -1318,9 +1612,9 @@ class SearchEngine:
             "full_name": full_name,
             "major": major,
             "graduation_year": graduation_year,
-            "resume_link": metadata.get("resume_link", meta.get("resume_link", "")),
-            "linkedin": metadata.get("linkedin", meta.get("linkedin", "")),
-            "github": metadata.get("github", meta.get("github", "")),
+            "resume_link": resolved_links["resume_link"],
+            "linkedin": resolved_links["linkedin"],
+            "github": resolved_links["github"],
             "skills": skills,
             "canonical_skills": canonical_skills,
             "summary": "\n".join(summary) if isinstance(summary, list) else str(summary or ""),
