@@ -190,19 +190,21 @@ def _escape_text(value: str) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
-def _result_card_html(rank: int, display_name: str, major: str, score_pct: str, score_col: str) -> str:
-    safe_display_name = _escape_text(display_name)
+def _result_card_html(rank: int, name: str, major: str, score_pct: str, score_color: str) -> str:
+    # Use different background colors for top 3
+    rank_class = f"card-rank-{rank}" if rank <= 3 else "card-rank-4-plus"
+    safe_name = _escape_text(name)
     safe_major = _escape_text(major)
     major_line = f'<div class="result-major">{safe_major}</div>' if major else ""
     return (
-        f'<div class="result-card">'
+        f'<div class="result-card {rank_class}">'
         f'<div class="{_rank_class(rank)}">#{rank}</div>'
         f'<div style="flex-grow:1;">'
-        f'<div class="result-name">{safe_display_name}</div>'
+        f'<div class="result-name">{safe_name}</div>'
         f"{major_line}"
         f"</div>"
         f'<div style="text-align:right;">'
-        f'<div class="result-score" style="color:{score_col};">{score_pct}</div>'
+        f'<div class="result-score" style="color:{score_color};">{score_pct}</div>'
         f"</div>"
         f"</div>"
     )
@@ -229,93 +231,31 @@ def render_results(results: list[ResumeResult]):
         score_pct = f"{r.score * 100:.0f}%"
         score_col = _score_color(r.score)
         display_name = r.full_name if r.full_name else r.filename
-        st.markdown(_result_card_html(r.rank, display_name, r.major, score_pct, score_col), unsafe_allow_html=True)
-        with st.expander(f"Details — {display_name}", expanded=False):
-            _render_detail_panel(r)
-
-
-def _render_filter_status(filter_status: dict):
-    if not filter_status:
-        return
-    st.markdown("### Hard Filters")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Must-haves", filter_status.get("must_have_status", "n/a"))
-    col2.metric("Years", filter_status.get("years_experience_status", "n/a"))
-    col3.metric("Degree", filter_status.get("degree_status", "n/a"))
-    if filter_status.get("location_status") != "not_requested":
-        st.markdown(f"**Location status:** {filter_status.get('location_status')}")
-    matched_must = filter_status.get("matched_must_have_skills", [])
-    matched_pref = filter_status.get("matched_preferred_skills", [])
-    if matched_must:
-        st.markdown("**Matched must-have skills:** " + ", ".join(matched_must))
-    if matched_pref:
-        st.markdown("**Matched preferred skills:** " + ", ".join(matched_pref))
-    if filter_status.get("minimum_years_required") is not None:
-        st.markdown(
-            f"**Experience:** required {filter_status.get('minimum_years_required')} yrs, "
-            f"candidate {filter_status.get('candidate_years_experience', 'unknown')} yrs"
-        )
-
-
-def _render_ranking_details(details: dict):
-    if not details:
-        return
-    st.markdown("### Retrieval Breakdown")
-    cols = st.columns(4)
-    cols[0].metric("Best evidence", f"{float(details.get('base_search_score', 0.0)):.3f}")
-    cols[1].metric("Mean top chunks", f"{float(details.get('mean_top_chunk_score', 0.0)):.3f}")
-    cols[2].metric("Evidence chunks", int(details.get("evidence_chunk_count", 0)))
-    if "reranker_score" in details:
-        cols[3].metric("Reranker Score", f"{float(details.get('reranker_score', 0.0)):.3f}")
-    else:
-        cols[3].metric("Backend", details.get("retrieval_backend", "n/a"))
-    
-    if details.get("total_must_have_count"):
-        st.markdown(
-            f"**Must-have matches:** {details.get('matched_must_have_count', 0)} / {details.get('total_must_have_count', 0)}"
-        )
-    if details.get("total_preferred_count"):
-        st.markdown(
-            f"**Preferred matches:** {details.get('matched_preferred_count', 0)} / {details.get('total_preferred_count', 0)}"
-        )
-
-
-def _render_evidence_chunks(chunks: list[dict]):
-    if not chunks:
-        return
-    st.markdown("### Evidence Chunks")
-    for idx, chunk in enumerate(chunks, 1):
-        st.markdown(
-            f"**{idx}. {chunk.get('section_type', 'other').title()}**  \
-Score: `{chunk.get('score', 0.0):.3f}`"
-        )
-        st.markdown(f"> {chunk.get('text', '').strip()[:700]}")
+        
+        # Group card and expander for visual coupling and CSS targeting
+        with st.container():
+            st.markdown(_result_card_html(r.rank, display_name, r.major, score_pct, score_col), unsafe_allow_html=True)
+            with st.expander("Details & Analysis", expanded=False):
+                _render_detail_panel(r)
 
 
 def _render_grok_details(r: ResumeResult):
-    if not r.grok_status or r.grok_status == "not_requested":
+    grok_status = getattr(r, "grok_status", "") or ""
+    if grok_status in ("", "not_requested", "skipped", "unavailable", "error"):
         return
-    st.markdown("### Grok Assessment")
-    st.markdown(f"**Status:** {r.grok_status}")
-    if r.company_match_status and r.company_match_status != "not_requested":
-        st.markdown(f"**Company match:** {r.company_match_status.replace('_', ' ')}")
-    if r.page_count is None:
-        st.markdown("**Page count:** unknown")
-    else:
-        st.markdown(f"**Page count:** {r.page_count}")
-
-    if r.grok_fit_score:
-        st.markdown(f"**Fit score:** {r.grok_fit_score * 100:.0f}%")
-    if r.grok_resume_quality_score:
-        st.markdown(f"**Resume quality score:** {r.grok_resume_quality_score * 100:.0f}%")
-    if r.grok_summary:
-        st.markdown(r.grok_summary)
-    if r.grok_matched_requirements:
-        st.markdown("**Matched requirements:** " + ", ".join(r.grok_matched_requirements))
-    if r.grok_missing_requirements:
-        st.markdown("**Missing or unclear requirements:** " + ", ".join(r.grok_missing_requirements))
-    if r.grok_weakness_flags:
-        st.markdown("**Weakness flags:** " + ", ".join(r.grok_weakness_flags))
+    st.markdown('<div class="evaluation-section">', unsafe_allow_html=True)
+    st.markdown("### Resume Evaluation")
+    cols = st.columns(2)
+    fit = float(getattr(r, "grok_fit_score", 0) or 0)
+    quality = float(getattr(r, "grok_resume_quality_score", 0) or 0)
+    cols[0].metric("Qualification Fit", f"{fit * 10:.1f}/10")
+    cols[1].metric("Resume Quality", f"{quality * 10:.1f}/10")
+    
+    if getattr(r, "explanation", ""):
+        st.markdown(f"**Match Explanation:** {r.explanation}")
+    elif getattr(r, "grok_summary", ""):
+        st.markdown(f"**Match Explanation:** {r.grok_summary}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def _render_detail_panel(r: ResumeResult):
@@ -349,13 +289,7 @@ def _render_detail_panel(r: ResumeResult):
         skills_html = "".join(f'<span class="matched-skill">{_escape_text(s)}</span>' for s in r.matched_skills)
         st.markdown(f'<div style="margin-top:0.6rem;"><span class="detail-label">Matched Skills:</span><br/>{skills_html}</div>', unsafe_allow_html=True)
 
-    _render_filter_status(r.hard_filter_status)
-    _render_ranking_details(r.ranking_details)
     _render_grok_details(r)
-    _render_evidence_chunks(r.top_evidence_chunks)
-
-
-
 
 
 
