@@ -25,8 +25,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from streamlit.config import MODEL_NAME, PROJECT_ROOT as CONFIG_PROJECT_ROOT
-from streamlit.job_description import SKILL_ALIASES
+try:
+    from streamlit.config import MODEL_NAME, PROJECT_ROOT as CONFIG_PROJECT_ROOT
+    from streamlit.job_description import SKILL_ALIASES
+except (ImportError, ModuleNotFoundError):
+    # Fallback for when running from root and streamlit/ is not a package or shadowed
+    import sys
+    sys.path.append(str(PROJECT_ROOT / "streamlit"))
+    from config import MODEL_NAME, PROJECT_ROOT as CONFIG_PROJECT_ROOT
+    from job_description import SKILL_ALIASES
 
 PROJECT_ROOT = CONFIG_PROJECT_ROOT
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
