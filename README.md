@@ -1,6 +1,8 @@
 # TalentLens_Public
 NLP pipeline for public resume dataset for TalentLens
 
+Demo: https://talentlenspublic-nakqyg2siefop4zhwucjcq.streamlit.app/ 
+
 ## Discord Resume Data
 
 Resume images and PDFs collected from Discord are stored on a shared Dropbox folder (not in the git repo due to file size).
