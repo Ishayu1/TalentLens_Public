@@ -236,12 +236,10 @@ print("Folder processor loaded.")
 
 
 TEST_MEMBERS_DIR = PROJECT_ROOT / "test" / "members"
-TEST_BOARD_DIR   = PROJECT_ROOT / "test" / "board"
 
 ds3_member_records = process_folder(TEST_MEMBERS_DIR, source="ds3_members")
-ds3_board_records  = process_folder(TEST_BOARD_DIR, source="ds3_board")
 
-ds3_records = ds3_member_records + ds3_board_records
+ds3_records = ds3_member_records
 print(f"Test total: {len(ds3_records)} resumes")
 
 

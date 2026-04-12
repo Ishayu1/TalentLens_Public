@@ -62,7 +62,7 @@ PROCESSED_DIR = DATA_DIR / "processed"
 PARSED_RESUMES_PATH = PROCESSED_DIR / "resumes_parsed.json"
 RESUME_CHUNKS_PATH = PROCESSED_DIR / "resume_chunks.json"
 # CHUNK_METADATA_PATH imported from config
-MEMBER_SOURCES = {"ds3_members", "ds3_board"}
+MEMBER_SOURCES = {"ds3_members"}
 DEFAULT_MEMBER_SOURCE = "ds3_members"
 LOCAL_MEMBER_RESUME_DIRS = [
     MEMBER_RESUMES_DIR,

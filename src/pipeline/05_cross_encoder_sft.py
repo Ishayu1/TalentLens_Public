@@ -21,9 +21,10 @@ from sentence_transformers import CrossEncoder, InputExample, losses
 # Force project root
 PROJECT_ROOT = Path("/Users/guest2/Desktop/repos/talentlens/TalentLens_Public")
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "src" / "ui"))
 
-from streamlit.config import SKILL_SUGGESTIONS
-from streamlit.job_description import SKILL_ALIASES
+from config import SKILL_SUGGESTIONS
+from job_description import SKILL_ALIASES
 
 DEVICE = "cpu"
 print(f"Training device: {DEVICE}")
