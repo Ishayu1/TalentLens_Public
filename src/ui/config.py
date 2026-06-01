@@ -3,6 +3,7 @@ TalentLens configuration — paths, model settings, and UI constants.
 """
 
 from pathlib import Path
+import os
 
 # ---------------------------------------------------------------------------
 # Paths (relative to the *project root*, i.e. TalentLens_Public/)
@@ -25,7 +26,7 @@ CONFIG_JSON_PATH = DATA_DIR / "configs" / "config.json"
 # ---------------------------------------------------------------------------
 # Embedding model
 # ---------------------------------------------------------------------------
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = os.getenv("TALENTLENS_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = 384
 
 # ---------------------------------------------------------------------------

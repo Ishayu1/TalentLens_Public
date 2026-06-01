@@ -17,6 +17,7 @@ faiss-cpu
 
 # API (resume_matching_pipeline)
 fastapi
+uvicorn[standard]
 pydantic
 pydantic-settings  # required for chromadb on Python 3.14+
 

@@ -23,7 +23,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
         "https://ds3atucsd.com",
         "https://www.ds3atucsd.com",
     ],
@@ -242,19 +244,23 @@ async def search_resumes(request: SearchRequest):
 
 @app.get("/health")
 async def health():
-    if engine is None:
+    try:
+        search_engine = get_engine()
+    except Exception as exc:
         return {
-            "status": "healthy",
-            "message": "TalentLens API is running",
+            "status": "degraded",
+            "message": "TalentLens API is running, but the search engine failed to load",
             "engine_loaded": False,
+            "error": str(exc),
         }
 
     return {
         "status": "healthy",
         "message": "TalentLens API is running",
         "engine_loaded": True,
-        "num_resumes": getattr(engine, "resume_count", None),
-        "demo_mode": getattr(engine, "demo_mode", None),
-        "mode_label": getattr(engine, "mode_label", None),
-        "retrieval_backend": getattr(engine, "retrieval_backend", None),
+        "num_resumes": getattr(search_engine, "resume_count", None),
+        "demo_mode": getattr(search_engine, "demo_mode", None),
+        "mode_label": getattr(search_engine, "mode_label", None),
+        "retrieval_backend": getattr(search_engine, "retrieval_backend", None),
+        "startup_issues": getattr(search_engine, "_startup_issues", []),
     }
