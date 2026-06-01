@@ -230,7 +230,11 @@ def _looks_like_full_name(name: str) -> bool:
 
 
 def _extract_name_from_contact(contact: str) -> str:
-    first_line = str(contact or "").splitlines()[0].strip()
+    lines = str(contact or "").splitlines()
+    if not lines:
+        return ""
+
+    first_line = lines[0].strip()
     if not first_line:
         return ""
     if EMAIL_RE.search(first_line) or PHONE_RE.search(first_line) or URL_RE.search(first_line):
