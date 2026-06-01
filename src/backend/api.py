@@ -56,6 +56,53 @@ def safe_float(value):
     except (TypeError, ValueError):
         return None
 
+def safe_text(value):
+    if value is None:
+        return None
+
+    try:
+        # Handles pandas/numpy NaN without importing pandas.
+        if value != value:
+            return None
+    except Exception:
+        pass
+
+    value = str(value).strip()
+
+    if not value or value.lower() in {"nan", "none", "null"}:
+        return None
+
+    return value
+
+def safe_list(value):
+    if value is None:
+        return []
+
+    try:
+        # Handles pandas/numpy NaN without importing pandas.
+        if value != value:
+            return []
+    except Exception:
+        pass
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, tuple):
+        return list(value)
+
+    if isinstance(value, set):
+        return list(value)
+
+    # Handle stringified empty lists from earlier conversions.
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned in {"", "[]", "nan", "None", "null"}:
+            return []
+        return [cleaned]
+
+    return []
+
 
 def get_resume_metadata(search_engine, filename: str | None) -> dict:
     """
@@ -87,38 +134,41 @@ def serialize_result(search_engine, result):
 
     return {
         "rank": getattr(result, "rank", None),
-        "filename": getattr(result, "filename", None),
-        "candidate_id": getattr(result, "candidate_id", None),
+        "filename": safe_text(getattr(result, "filename", None)),
+        "candidate_id": safe_text(getattr(result, "candidate_id", None)),
         "score": safe_float(getattr(result, "score", None)),
         "semantic_score": safe_float(getattr(result, "semantic_score", None)),
-        "file_path": getattr(result, "file_path", None),
-        "full_name": getattr(result, "full_name", None) or metadata.get("full_name"),
-        "major": getattr(result, "major", None) or metadata.get("major"),
-        "graduation_year": getattr(result, "graduation_year", None)
-        or metadata.get("graduation_year"),
+        "file_path": safe_text(getattr(result, "file_path", None)),
+        "full_name": safe_text(getattr(result, "full_name", None)) or safe_text(metadata.get("full_name")),
+        "major": safe_text(getattr(result, "major", None)) or safe_text(metadata.get("major")),
+        "graduation_year": safe_text(getattr(result, "graduation_year", None)) or safe_text(metadata.get("graduation_year")),
 
         # Important recruiter-facing links
-        "resume_link": getattr(result, "resume_link", None) or metadata.get("resume_link"),
-        "linkedin": getattr(result, "linkedin", None) or metadata.get("linkedin"),
-        "github": getattr(result, "github", None) or metadata.get("github"),
+        "resume_link": safe_text(getattr(result, "resume_link", None)) or safe_text(metadata.get("resume_link")),
+        "linkedin": safe_text(getattr(result, "linkedin", None)) or safe_text(metadata.get("linkedin")),
+        "github": safe_text(getattr(result, "github", None)) or safe_text(metadata.get("github")),
 
-        "matched_skills": getattr(result, "matched_skills", []) or [],
-        "top_evidence_chunks": getattr(result, "top_evidence_chunks", []) or [],
+        "matched_skills": safe_list(getattr(result, "matched_skills", [])),
+        "top_evidence_chunks": safe_list(getattr(result, "top_evidence_chunks", [])),
         "hard_filter_status": getattr(result, "hard_filter_status", None),
         "ranking_details": getattr(result, "ranking_details", None),
         "page_count": getattr(result, "page_count", None),
         "company_match_status": getattr(result, "company_match_status", None),
-        "grok_status": getattr(result, "grok_status", None),
+        "grok_status": safe_text(getattr(result, "grok_status", None)),
         "grok_fit_score": safe_float(getattr(result, "grok_fit_score", None)),
         "grok_resume_quality_score": safe_float(
             getattr(result, "grok_resume_quality_score", None)
         ),
-        "grok_summary": getattr(result, "grok_summary", None),
-        "grok_matched_requirements": getattr(result, "grok_matched_requirements", [])
-        or [],
-        "grok_missing_requirements": getattr(result, "grok_missing_requirements", [])
-        or [],
-        "grok_weakness_flags": getattr(result, "grok_weakness_flags", []) or [],
+        "grok_summary": safe_text(getattr(result, "grok_summary", None)),
+        "grok_matched_requirements": safe_list(
+            getattr(result, "grok_matched_requirements", [])
+        ),
+        "grok_missing_requirements": safe_list(
+            getattr(result, "grok_missing_requirements", [])
+        ),
+        "grok_weakness_flags": safe_list(
+            getattr(result, "grok_weakness_flags", [])
+        ),
     }
 
 
