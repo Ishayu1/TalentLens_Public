@@ -50,10 +50,76 @@ def get_engine():
 def safe_float(value):
     if value is None:
         return None
+
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def get_resume_metadata(search_engine, filename: str | None) -> dict:
+    """
+    Look up the original resume metadata for fields that may not be carried
+    directly on the ResumeResult object, such as resume_link, linkedin, github.
+    """
+    if not filename:
+        return {}
+
+    metadata_by_filename = getattr(search_engine, "resume_metadata_by_filename", {}) or {}
+
+    if filename in metadata_by_filename:
+        return metadata_by_filename.get(filename) or {}
+
+    for item in getattr(search_engine, "resume_metadata", []) or []:
+        if item.get("filename") == filename:
+            return item
+
+    return {}
+
+
+def serialize_result(search_engine, result):
+    """
+    Convert an internal ResumeResult object into a frontend-safe API payload.
+    Includes metadata links from resume_metadata when they are not present
+    directly on the result object.
+    """
+    metadata = get_resume_metadata(search_engine, getattr(result, "filename", None))
+
+    return {
+        "rank": getattr(result, "rank", None),
+        "filename": getattr(result, "filename", None),
+        "candidate_id": getattr(result, "candidate_id", None),
+        "score": safe_float(getattr(result, "score", None)),
+        "semantic_score": safe_float(getattr(result, "semantic_score", None)),
+        "file_path": getattr(result, "file_path", None),
+        "full_name": getattr(result, "full_name", None) or metadata.get("full_name"),
+        "major": getattr(result, "major", None) or metadata.get("major"),
+        "graduation_year": getattr(result, "graduation_year", None)
+        or metadata.get("graduation_year"),
+
+        # Important recruiter-facing links
+        "resume_link": getattr(result, "resume_link", None) or metadata.get("resume_link"),
+        "linkedin": getattr(result, "linkedin", None) or metadata.get("linkedin"),
+        "github": getattr(result, "github", None) or metadata.get("github"),
+
+        "matched_skills": getattr(result, "matched_skills", []) or [],
+        "top_evidence_chunks": getattr(result, "top_evidence_chunks", []) or [],
+        "hard_filter_status": getattr(result, "hard_filter_status", None),
+        "ranking_details": getattr(result, "ranking_details", None),
+        "page_count": getattr(result, "page_count", None),
+        "company_match_status": getattr(result, "company_match_status", None),
+        "grok_status": getattr(result, "grok_status", None),
+        "grok_fit_score": safe_float(getattr(result, "grok_fit_score", None)),
+        "grok_resume_quality_score": safe_float(
+            getattr(result, "grok_resume_quality_score", None)
+        ),
+        "grok_summary": getattr(result, "grok_summary", None),
+        "grok_matched_requirements": getattr(result, "grok_matched_requirements", [])
+        or [],
+        "grok_missing_requirements": getattr(result, "grok_missing_requirements", [])
+        or [],
+        "grok_weakness_flags": getattr(result, "grok_weakness_flags", []) or [],
+    }
 
 
 @app.get("/")
@@ -89,7 +155,7 @@ async def search_resumes(request: SearchRequest):
     try:
         search_engine = get_engine()
 
-        results = search_engine.search(
+        raw_results = search_engine.search(
             query=request.query,
             top_k=request.top_k,
             min_score=request.min_score,
@@ -97,6 +163,10 @@ async def search_resumes(request: SearchRequest):
             recruiter_company=request.recruiter_company,
             recruiter_job_title=request.recruiter_job_title,
         )
+
+        results_payload = [
+            serialize_result(search_engine, result) for result in raw_results
+        ]
 
         return {
             "parsed_job_description": search_engine.last_query_analysis
@@ -107,40 +177,13 @@ async def search_resumes(request: SearchRequest):
                 "mode_label": getattr(search_engine, "mode_label", None),
                 "retrieval_backend": getattr(search_engine, "retrieval_backend", None),
             },
-            "results": [
-                {
-                    "rank": result.rank,
-                    "filename": result.filename,
-                    "candidate_id": result.candidate_id,
-                    "score": safe_float(result.score),
-                    "semantic_score": safe_float(result.semantic_score),
-                    "file_path": result.file_path,
-                    "full_name": result.full_name,
-                    "major": result.major,
-                    "graduation_year": result.graduation_year,
-                    "matched_skills": result.matched_skills,
-                    "top_evidence_chunks": result.top_evidence_chunks,
-                    "hard_filter_status": result.hard_filter_status,
-                    "ranking_details": result.ranking_details,
-                    "page_count": result.page_count,
-                    "company_match_status": result.company_match_status,
-                    "grok_status": result.grok_status,
-                    "grok_fit_score": safe_float(result.grok_fit_score),
-                    "grok_resume_quality_score": safe_float(
-                        result.grok_resume_quality_score
-                    ),
-                    "grok_summary": result.grok_summary,
-                    "grok_matched_requirements": result.grok_matched_requirements,
-                    "grok_missing_requirements": result.grok_missing_requirements,
-                    "grok_weakness_flags": result.grok_weakness_flags,
-                }
-                for result in results
-            ],
+            "results": results_payload,
         }
 
     except Exception as exc:
         print("TalentLens search failed:", flush=True)
         print(traceback.format_exc(), flush=True)
+
         raise HTTPException(
             status_code=500,
             detail=f"TalentLens search failed: {str(exc)}",
