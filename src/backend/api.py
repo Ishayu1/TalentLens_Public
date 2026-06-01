@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 import sys
@@ -14,6 +15,30 @@ app = FastAPI()
 engine = SearchEngine(strict_startup=True)
 
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://ds3atucsd.com",
+        "https://www.ds3atucsd.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "TalentLens API is running",
+        "docs": "/docs",
+        "health": "/health",
+        "search": "/search",
+    }
+
+
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 10
@@ -25,6 +50,11 @@ class SearchRequest(BaseModel):
 
 @app.post("/search")
 async def search_resumes(request: SearchRequest):
+    if request.input_mode not in {"Skills", "Job Description"}:
+        raise HTTPException(
+            status_code=400,
+            detail="input_mode must be either 'Skills' or 'Job Description'.",
+        )
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query must not be empty.")
 
@@ -38,7 +68,9 @@ async def search_resumes(request: SearchRequest):
     )
 
     return {
-        "parsed_job_description": engine.last_query_analysis if request.input_mode == "Job Description" else None,
+        "parsed_job_description": engine.last_query_analysis
+        if request.input_mode == "Job Description"
+        else None,
         "results": [
             {
                 "rank": result.rank,
