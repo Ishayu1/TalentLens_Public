@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 import sys
+import traceback
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 UI_DIR = PROJECT_ROOT / "src" / "ui"
@@ -138,6 +139,8 @@ async def search_resumes(request: SearchRequest):
         }
 
     except Exception as exc:
+        print("TalentLens search failed:", flush=True)
+        print(traceback.format_exc(), flush=True)
         raise HTTPException(
             status_code=500,
             detail=f"TalentLens search failed: {str(exc)}",
